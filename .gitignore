@@ -1,0 +1,10 @@
+cat <<'EOF' > .gitignore
+node_modules
+.env
+npm-debug.log*
+.yarn*
+.pnpm-store
+dist
+build
+.DS_Store
+EOF
