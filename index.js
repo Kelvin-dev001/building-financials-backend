@@ -3,6 +3,7 @@ import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 import dotenv from "dotenv";
+import compression from "compression";
 import { createClient } from "@supabase/supabase-js";
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
@@ -33,11 +34,12 @@ const app = express();
 app.use(helmet());
 app.use(
   cors({
-    origin: "*", // TODO: restrict to your Vercel domain in prod
+    origin: ["https://building-financials-frontend.vercel.app"],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"]
   })
 );
+app.use(compression());
 app.use(express.json());
 app.use(morgan("dev"));
 
@@ -66,12 +68,7 @@ async function attachRole(req, res, next) {
   try {
     if (!req.user?.id) return res.status(401).json({ error: "Unauthorized (no user id)" });
 
-    const { data, error } = await supabaseService
-      .from("app_users")
-      .select("role")
-      .eq("id", req.user.id)
-      .single();
-
+    const { data, error } = await supabaseService.from("app_users").select("role").eq("id", req.user.id).single();
     if (error || !data) return res.status(403).json({ error: "No role found for user" });
 
     req.user.app_role = data.role;
@@ -90,7 +87,6 @@ function requireRole(roles = []) {
   };
 }
 
-// Audit-mode block (non-admin edits blocked)
 function blockIfAudit(req, res, next) {
   if (auditMode && req.user?.app_role !== "admin") {
     return res.status(423).json({ error: "Audit mode: edits locked" });
@@ -98,7 +94,6 @@ function blockIfAudit(req, res, next) {
   next();
 }
 
-// ---------- Audit helper ----------
 async function logAudit({ actorId, action, entity, entityId, beforeData = null, afterData = null }) {
   try {
     await supabaseService.from("audit_logs").insert({
@@ -114,7 +109,6 @@ async function logAudit({ actorId, action, entity, entityId, beforeData = null, 
   }
 }
 
-// ---------- Validation helpers ----------
 function assertPositiveNumber(value, name) {
   if (value === undefined || value === null || Number(value) <= 0) {
     throw new Error(`${name} must be > 0`);
@@ -124,7 +118,7 @@ function assertIn(value, allowed, name) {
   if (!allowed.includes(value)) throw new Error(`${name} must be one of: ${allowed.join(", ")}`);
 }
 
-// ---------- Health ----------
+// ---------- Health & Status ----------
 app.get("/health", async (_req, res) => {
   try {
     const { data, error } = await supabaseService.from("balances").select("*").limit(1);
@@ -134,6 +128,9 @@ app.get("/health", async (_req, res) => {
     console.error("Health error:", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
+});
+app.get("/api/status", (_req, res) => {
+  res.json({ ok: true, version: "1.2.1", audit_mode: auditMode, env: "render" });
 });
 
 // ---------- Auth info ----------
@@ -145,7 +142,7 @@ app.get("/api/admin/check", requireAuth, attachRole, requireRole(["admin"]), (_r
   res.json({ ok: true, message: "Admin access confirmed" });
 });
 
-// ---------- Core flows (with audit/soft-delete/locks) ----------
+// ---------- Core flows (audit/locks/soft-delete ready) ----------
 app.post("/api/contributions", requireAuth, attachRole, blockIfAudit, requireRole(["investor", "admin"]), async (req, res) => {
   try {
     assertPositiveNumber(req.body.eur_amount, "eur_amount");
