@@ -4,6 +4,9 @@ import helmet from "helmet";
 import morgan from "morgan";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
+import ExcelJS from "exceljs";
+import PDFDocument from "pdfkit";
+import streamBuffers from "stream-buffers";
 
 dotenv.config();
 
@@ -15,7 +18,7 @@ const {
 } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !SUPABASE_ANON_KEY) {
-  console.error("Missing Supabase env vars. You must set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY.");
+  console.error("Missing Supabase env vars. Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY.");
   process.exit(1);
 }
 
@@ -26,7 +29,7 @@ const app = express();
 app.use(helmet());
 app.use(
   cors({
-    origin: "*",
+    origin: "*", // tighten to your Vercel domain in production
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"]
   })
@@ -42,9 +45,8 @@ async function requireAuth(req, res, next) {
     if (!token) return res.status(401).json({ error: "Missing bearer token" });
 
     const { data, error } = await supabaseAuth.auth.getUser(token);
-    if (error || !data?.user) {
-      return res.status(401).json({ error: "Invalid or expired token" });
-    }
+    if (error || !data?.user) return res.status(401).json({ error: "Invalid or expired token" });
+
     req.user = data.user;
     next();
   } catch (err) {
@@ -56,15 +58,12 @@ async function requireAuth(req, res, next) {
 async function attachRole(req, res, next) {
   try {
     if (!req.user?.id) return res.status(401).json({ error: "Unauthorized (no user id)" });
-
     const { data, error } = await supabaseService
       .from("app_users")
       .select("role")
       .eq("id", req.user.id)
       .single();
-
     if (error || !data) return res.status(403).json({ error: "No role found for user" });
-
     req.user.app_role = data.role;
     next();
   } catch (err) {
@@ -76,9 +75,7 @@ async function attachRole(req, res, next) {
 function requireRole(roles = []) {
   return (req, res, next) => {
     const role = req.user?.app_role;
-    if (!role || !roles.includes(role)) {
-      return res.status(403).json({ error: "Forbidden: insufficient role" });
-    }
+    if (!role || !roles.includes(role)) return res.status(403).json({ error: "Forbidden: insufficient role" });
     next();
   };
 }
@@ -99,7 +96,7 @@ async function logAudit({ actorId, action, entity, entityId, beforeData = null, 
   }
 }
 
-// ---------- Routes ----------
+// ---------- Health ----------
 app.get("/health", async (_req, res) => {
   try {
     const { data, error } = await supabaseService.from("balances").select("*").limit(1);
@@ -111,33 +108,25 @@ app.get("/health", async (_req, res) => {
   }
 });
 
+// ---------- Auth info ----------
 app.get("/api/ping", (_req, res) => res.json({ message: "pong" }));
 
 app.get("/api/me", requireAuth, attachRole, (req, res) => {
-  res.json({
-    id: req.user.id,
-    email: req.user.email,
-    role: req.user.app_role || null
-  });
+  res.json({ id: req.user.id, email: req.user.email, role: req.user.app_role || null });
 });
 
-app.get("/api/admin/check", requireAuth, attachRole, requireRole(["admin"]), (req, res) => {
-  res.json({ ok: true, role: req.user.app_role, message: "Admin access confirmed" });
+app.get("/api/admin/check", requireAuth, attachRole, requireRole(["admin"]), (_req, res) => {
+  res.json({ ok: true, message: "Admin access confirmed" });
 });
 
-// Investor create contribution
+// ---------- Core flows ----------
 app.post("/api/contributions", requireAuth, attachRole, requireRole(["investor", "admin"]), async (req, res) => {
   const { eur_amount, note } = req.body;
   if (!eur_amount || Number(eur_amount) <= 0) return res.status(400).json({ error: "eur_amount must be > 0" });
   try {
     const { data, error } = await supabaseService
       .from("contributions")
-      .insert({
-        investor_id: req.user.id,
-        eur_amount,
-        note,
-        status: "pending"
-      })
+      .insert({ investor_id: req.user.id, eur_amount, note, status: "pending" })
       .select()
       .single();
     if (error) throw error;
@@ -149,7 +138,6 @@ app.post("/api/contributions", requireAuth, attachRole, requireRole(["investor",
   }
 });
 
-// Developer confirm receipt
 app.post("/api/receipts", requireAuth, attachRole, requireRole(["developer", "admin"]), async (req, res) => {
   const { contribution_id, kes_received, fx_rate } = req.body;
   if (!contribution_id || !kes_received || Number(kes_received) <= 0) {
@@ -176,7 +164,6 @@ app.post("/api/receipts", requireAuth, attachRole, requireRole(["developer", "ad
   }
 });
 
-// Developer log expense
 app.post("/api/expenses", requireAuth, attachRole, requireRole(["developer", "admin"]), async (req, res) => {
   const { amount_kes, category, expense_date, description, receipt_url } = req.body;
   if (!amount_kes || Number(amount_kes) <= 0) return res.status(400).json({ error: "amount_kes must be > 0" });
@@ -226,7 +213,68 @@ app.post("/api/admin/receipts/:id/approve", requireAuth, attachRole, requireRole
   }
 });
 
-// ---------- List endpoints ----------
+// ---------- Flags & Comments ----------
+app.post("/api/expenses/:id/flag", requireAuth, attachRole, requireRole(["investor", "admin"]), async (req, res) => {
+  const { flagged = true } = req.body;
+  try {
+    const { data: before } = await supabaseService.from("expenses").select("*").eq("id", req.params.id).single();
+    const { error } = await supabaseService.from("expenses").update({ flagged }).eq("id", req.params.id);
+    if (error) throw error;
+    await logAudit({
+      actorId: req.user.id,
+      action: flagged ? "flag" : "unflag",
+      entity: "expenses",
+      entityId: req.params.id,
+      beforeData: before,
+      afterData: { ...before, flagged }
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("flag expense error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/expenses/:id/comments", requireAuth, attachRole, requireRole(["investor", "admin", "developer"]), async (req, res) => {
+  const { comment } = req.body;
+  if (!comment) return res.status(400).json({ error: "comment required" });
+  try {
+    const { data, error } = await supabaseService
+      .from("expense_comments")
+      .insert({ expense_id: req.params.id, commenter_id: req.user.id, comment })
+      .select()
+      .single();
+    if (error) throw error;
+    await logAudit({
+      actorId: req.user.id,
+      action: "comment",
+      entity: "expense_comments",
+      entityId: data.id,
+      afterData: data
+    });
+    res.json({ ok: true, id: data.id });
+  } catch (err) {
+    console.error("comment error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/expenses/:id/comments", requireAuth, attachRole, async (req, res) => {
+  try {
+    const { data, error } = await supabaseService
+      .from("expense_comments")
+      .select("*")
+      .eq("expense_id", req.params.id)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("list comments error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Lists ----------
 app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
   try {
     if (req.user.app_role === "admin") {
@@ -296,7 +344,120 @@ app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
   }
 });
 
-// Optional: audit log list for admin
+// ---------- Reporting helper ----------
+async function getReports() {
+  // balances view
+  const { data: balances, error: balErr } = await supabaseService.from("balances").select("*").single();
+  if (balErr) throw balErr;
+
+  // contributions by investor
+  const { data: contribs, error: cErr } = await supabaseService.rpc("report_contributions_by_investor");
+  // if RPC not defined, fallback to SQL:
+  // const { data: contribs, error: cErr } = await supabaseService
+  //   .from("contributions")
+  //   .select("investor_id, eur_amount")
+  //   .eq("status", "pending")
+  //   .maybe other filters...
+  if (cErr) throw cErr;
+
+  // expenses by category
+  const { data: expensesByCat, error: eErr } = await supabaseService.rpc("report_expenses_by_category");
+  if (eErr) throw eErr;
+
+  // monthly cashflow
+  const { data: monthlyCash, error: mErr } = await supabaseService.rpc("report_monthly_cashflow");
+  if (mErr) throw mErr;
+
+  return { balances, contribs, expensesByCat, monthlyCash };
+}
+
+// ---------- Reporting endpoints ----------
+app.get("/api/reports/summary", requireAuth, attachRole, requireRole(["admin", "investor", "developer"]), async (_req, res) => {
+  try {
+    const { balances, contribs, expensesByCat, monthlyCash } = await getReports();
+    res.json({ balances, contributions_by_investor: contribs, expenses_by_category: expensesByCat, monthly_cashflow: monthlyCash });
+  } catch (err) {
+    console.error("report summary error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Exports ----------
+app.get("/api/export/excel", requireAuth, attachRole, requireRole(["admin"]), async (_req, res) => {
+  try {
+    const { balances, contribs, expensesByCat, monthlyCash } = await getReports();
+    const wb = new ExcelJS.Workbook();
+    wb.creator = "Building Financials";
+    const sheet = wb.addWorksheet("Summary");
+
+    sheet.addRow(["Balances"]);
+    sheet.addRow(["Total Received KES", balances.total_received_kes]);
+    sheet.addRow(["Total Expenses KES", balances.total_expenses_kes]);
+    sheet.addRow(["Balance KES", balances.balance_kes]);
+    sheet.addRow([]);
+    sheet.addRow(["Contributions by Investor"]);
+    sheet.addRow(["Investor", "Total EUR"]);
+    contribs.forEach((c) => sheet.addRow([c.investor_name || c.investor_id, c.total_eur]));
+    sheet.addRow([]);
+    sheet.addRow(["Expenses by Category"]);
+    sheet.addRow(["Category", "Total KES"]);
+    expensesByCat.forEach((e) => sheet.addRow([e.category, e.total_kes]));
+    sheet.addRow([]);
+    sheet.addRow(["Monthly Cashflow"]);
+    sheet.addRow(["Month", "Inflow KES", "Outflow KES", "Net KES"]);
+    monthlyCash.forEach((m) => sheet.addRow([m.month, m.inflow_kes, m.outflow_kes, m.net_kes]));
+
+    const buffer = await wb.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", 'attachment; filename="financials.xlsx"');
+    res.send(Buffer.from(buffer));
+  } catch (err) {
+    console.error("excel export error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/export/pdf", requireAuth, attachRole, requireRole(["admin"]), async (_req, res) => {
+  try {
+    const { balances, contribs, expensesByCat, monthlyCash } = await getReports();
+    const doc = new PDFDocument();
+    const bufferStream = new streamBuffers.WritableStreamBuffer();
+
+    doc.fontSize(18).text("Building Financials Report", { underline: true });
+    doc.moveDown();
+    doc.fontSize(12).text(`Total Received (KES): ${balances.total_received_kes}`);
+    doc.text(`Total Expenses (KES): ${balances.total_expenses_kes}`);
+    doc.text(`Balance (KES): ${balances.balance_kes}`);
+    doc.moveDown();
+
+    doc.fontSize(14).text("Contributions by Investor");
+    contribs.forEach((c) => doc.fontSize(11).text(`${c.investor_name || c.investor_id}: EUR ${c.total_eur}`));
+    doc.moveDown();
+
+    doc.fontSize(14).text("Expenses by Category");
+    expensesByCat.forEach((e) => doc.fontSize(11).text(`${e.category}: KES ${e.total_kes}`));
+    doc.moveDown();
+
+    doc.fontSize(14).text("Monthly Cashflow");
+    monthlyCash.forEach((m) =>
+      doc.fontSize(11).text(`${m.month}: inflow ${m.inflow_kes}, outflow ${m.outflow_kes}, net ${m.net_kes}`)
+    );
+
+    doc.end();
+    doc.pipe(bufferStream);
+    bufferStream.on("finish", () => {
+      const pdfData = bufferStream.getBuffer();
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", 'attachment; filename="financials.pdf"');
+      res.send(pdfData);
+    });
+  } catch (err) {
+    console.error("pdf export error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Admin: audit logs ----------
 app.get("/api/admin/audit-logs", requireAuth, attachRole, requireRole(["admin"]), async (_req, res) => {
   try {
     const { data, error } = await supabaseService
