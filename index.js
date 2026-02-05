@@ -7,7 +7,6 @@ import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
-// --- ENV + SUPABASE SETUP ---
 const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
@@ -20,18 +19,14 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !SUPABASE_ANON_KEY) {
   process.exit(1);
 }
 
-// Service client = full DB access (server-side only)
 const supabaseService = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-// Auth client = validates user tokens (uses anon key)
 const supabaseAuth = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// --- EXPRESS APP SETUP ---
 const app = express();
 app.use(helmet());
 app.use(
   cors({
-    origin: "*", // tighten later to your Vercel domain
+    origin: "*",
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"]
   })
@@ -39,7 +34,7 @@ app.use(
 app.use(express.json());
 app.use(morgan("dev"));
 
-// --- MIDDLEWARE: AUTH + ROLE ---
+// ---------- Auth / Role helpers ----------
 async function requireAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization || "";
@@ -88,9 +83,23 @@ function requireRole(roles = []) {
   };
 }
 
-// --- ROUTES ---
+// ---------- Audit helper ----------
+async function logAudit({ actorId, action, entity, entityId, beforeData = null, afterData = null }) {
+  try {
+    await supabaseService.from("audit_logs").insert({
+      actor_id: actorId,
+      action,
+      entity,
+      entity_id: entityId || null,
+      before_data: beforeData,
+      after_data: afterData
+    });
+  } catch (err) {
+    console.error("audit log error:", err.message);
+  }
+}
 
-// Health check
+// ---------- Routes ----------
 app.get("/health", async (_req, res) => {
   try {
     const { data, error } = await supabaseService.from("balances").select("*").limit(1);
@@ -102,10 +111,8 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// Public ping
 app.get("/api/ping", (_req, res) => res.json({ message: "pong" }));
 
-// Authenticated: who am I
 app.get("/api/me", requireAuth, attachRole, (req, res) => {
   res.json({
     id: req.user.id,
@@ -114,54 +121,62 @@ app.get("/api/me", requireAuth, attachRole, (req, res) => {
   });
 });
 
-// Admin-only check
 app.get("/api/admin/check", requireAuth, attachRole, requireRole(["admin"]), (req, res) => {
   res.json({ ok: true, role: req.user.app_role, message: "Admin access confirmed" });
 });
 
-// Investor: create a contribution (EUR)
+// Investor create contribution
 app.post("/api/contributions", requireAuth, attachRole, requireRole(["investor", "admin"]), async (req, res) => {
   const { eur_amount, note } = req.body;
   if (!eur_amount || Number(eur_amount) <= 0) return res.status(400).json({ error: "eur_amount must be > 0" });
-
   try {
-    const { error } = await supabaseService.from("contributions").insert({
-      investor_id: req.user.id,
-      eur_amount,
-      note,
-      status: "pending"
-    });
+    const { data, error } = await supabaseService
+      .from("contributions")
+      .insert({
+        investor_id: req.user.id,
+        eur_amount,
+        note,
+        status: "pending"
+      })
+      .select()
+      .single();
     if (error) throw error;
-    res.json({ ok: true });
+    await logAudit({ actorId: req.user.id, action: "create", entity: "contributions", entityId: data.id, afterData: data });
+    res.json({ ok: true, id: data.id });
   } catch (err) {
     console.error("create contribution error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Developer: confirm receipt (KES)
+// Developer confirm receipt
 app.post("/api/receipts", requireAuth, attachRole, requireRole(["developer", "admin"]), async (req, res) => {
   const { contribution_id, kes_received, fx_rate } = req.body;
   if (!contribution_id || !kes_received || Number(kes_received) <= 0) {
     return res.status(400).json({ error: "contribution_id and kes_received > 0 required" });
   }
   try {
-    const { error } = await supabaseService.from("receipts").insert({
-      contribution_id,
-      developer_id: req.user.id,
-      kes_received,
-      fx_rate,
-      approved: false
-    });
+    const { data, error } = await supabaseService
+      .from("receipts")
+      .insert({
+        contribution_id,
+        developer_id: req.user.id,
+        kes_received,
+        fx_rate,
+        approved: false
+      })
+      .select()
+      .single();
     if (error) throw error;
-    res.json({ ok: true });
+    await logAudit({ actorId: req.user.id, action: "create", entity: "receipts", entityId: data.id, afterData: data });
+    res.json({ ok: true, id: data.id });
   } catch (err) {
     console.error("create receipt error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Developer: log expense
+// Developer log expense
 app.post("/api/expenses", requireAuth, attachRole, requireRole(["developer", "admin"]), async (req, res) => {
   const { amount_kes, category, expense_date, description, receipt_url } = req.body;
   if (!amount_kes || Number(amount_kes) <= 0) return res.status(400).json({ error: "amount_kes must be > 0" });
@@ -169,30 +184,41 @@ app.post("/api/expenses", requireAuth, attachRole, requireRole(["developer", "ad
     return res.status(400).json({ error: "invalid category" });
   }
   try {
-    const { error } = await supabaseService.from("expenses").insert({
-      developer_id: req.user.id,
-      amount_kes,
-      category,
-      expense_date,
-      description,
-      receipt_url
-    });
+    const { data, error } = await supabaseService
+      .from("expenses")
+      .insert({
+        developer_id: req.user.id,
+        amount_kes,
+        category,
+        expense_date,
+        description,
+        receipt_url
+      })
+      .select()
+      .single();
     if (error) throw error;
-    res.json({ ok: true });
+    await logAudit({ actorId: req.user.id, action: "create", entity: "expenses", entityId: data.id, afterData: data });
+    res.json({ ok: true, id: data.id });
   } catch (err) {
     console.error("create expense error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Admin: approve receipt
+// Admin approve receipt
 app.post("/api/admin/receipts/:id/approve", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
   try {
-    const { error } = await supabaseService
-      .from("receipts")
-      .update({ approved: true })
-      .eq("id", req.params.id);
+    const { data: before } = await supabaseService.from("receipts").select("*").eq("id", req.params.id).single();
+    const { error } = await supabaseService.from("receipts").update({ approved: true }).eq("id", req.params.id);
     if (error) throw error;
+    await logAudit({
+      actorId: req.user.id,
+      action: "approve",
+      entity: "receipts",
+      entityId: req.params.id,
+      beforeData: before,
+      afterData: { ...before, approved: true }
+    });
     res.json({ ok: true });
   } catch (err) {
     console.error("approve receipt error:", err);
@@ -200,7 +226,93 @@ app.post("/api/admin/receipts/:id/approve", requireAuth, attachRole, requireRole
   }
 });
 
-// --- START SERVER ---
+// ---------- List endpoints ----------
+app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
+  try {
+    if (req.user.app_role === "admin") {
+      const { data, error } = await supabaseService.from("contributions").select("*").order("created_at", { ascending: false });
+      if (error) throw error;
+      return res.json(data);
+    }
+    if (req.user.app_role === "investor") {
+      const { data, error } = await supabaseService
+        .from("contributions")
+        .select("*")
+        .eq("investor_id", req.user.id)
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      return res.json(data);
+    }
+    return res.status(403).json({ error: "Forbidden" });
+  } catch (err) {
+    console.error("list contributions error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
+  try {
+    if (req.user.app_role === "admin") {
+      const { data, error } = await supabaseService.from("receipts").select("*").order("created_at", { ascending: false });
+      if (error) throw error;
+      return res.json(data);
+    }
+    if (req.user.app_role === "developer") {
+      const { data, error } = await supabaseService
+        .from("receipts")
+        .select("*")
+        .eq("developer_id", req.user.id)
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      return res.json(data);
+    }
+    return res.status(403).json({ error: "Forbidden" });
+  } catch (err) {
+    console.error("list receipts error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
+  try {
+    if (req.user.app_role === "admin") {
+      const { data, error } = await supabaseService.from("expenses").select("*").order("created_at", { ascending: false });
+      if (error) throw error;
+      return res.json(data);
+    }
+    if (req.user.app_role === "developer") {
+      const { data, error } = await supabaseService
+        .from("expenses")
+        .select("*")
+        .eq("developer_id", req.user.id)
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      return res.json(data);
+    }
+    return res.status(403).json({ error: "Forbidden" });
+  } catch (err) {
+    console.error("list expenses error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Optional: audit log list for admin
+app.get("/api/admin/audit-logs", requireAuth, attachRole, requireRole(["admin"]), async (_req, res) => {
+  try {
+    const { data, error } = await supabaseService
+      .from("audit_logs")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("list audit error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`API listening on port ${PORT}`);
 });
