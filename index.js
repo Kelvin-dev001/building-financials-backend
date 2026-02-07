@@ -110,15 +110,15 @@ function assertPositiveNumber(value, name) {
     throw new Error(`${name} must be > 0`);
   }
 }
-function assertIn(value, allowed, name) {
-  if (!allowed.includes(value)) throw new Error(`${name} must be one of: ${allowed.join(", ")}`);
-}
-
 function paginationParams(req, defaultLimit = 10) {
   const page = Math.max(1, Number(req.query.page || 1));
   const limit = Math.max(1, Math.min(100, Number(req.query.limit || defaultLimit)));
   const offset = (page - 1) * limit;
   return { page, limit, offset };
+}
+function isLocked(createdAt) {
+  if (!createdAt) return false;
+  return Date.now() - new Date(createdAt).getTime() > 24 * 60 * 60 * 1000;
 }
 
 // ---------- Health & Status ----------
@@ -132,383 +132,195 @@ app.get("/health", async (_req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
-app.get("/api/status", (_req, res) => res.json({ ok: true, version: "1.2.1", audit_mode: auditMode, env: "render" }));
+app.get("/api/status", (_req, res) => res.json({ ok: true, version: "1.3.0", audit_mode: auditMode, env: "render" }));
 app.get("/api/ping", (_req, res) => res.json({ message: "pong" }));
 app.get("/api/me", requireAuth, attachRole, (req, res) => {
   res.json({ id: req.user.id, email: req.user.email, role: req.user.app_role || null, full_name: req.user.full_name || null, audit_mode: auditMode });
 });
 app.get("/api/admin/check", requireAuth, attachRole, requireRole(["admin"]), (_req, res) => res.json({ ok: true, message: "Admin access confirmed" }));
 
-// ---------- Core flows (GBP contributions) ----------
-app.post("/api/contributions", requireAuth, attachRole, blockIfAudit, requireRole(["investor", "admin"]), async (req, res) => {
-  try {
-    assertPositiveNumber(req.body.gbp_amount, "gbp_amount");
-    const { gbp_amount, note, date_sent } = req.body;
-    const { data, error } = await supabaseService
-      .from("contributions")
-      .insert({ investor_id: req.user.id, gbp_amount, note, date_sent, status: "pending", locked: false })
-      .select()
-      .single();
-    if (error) throw error;
-    await logAudit({ actorId: req.user.id, action: "create", entity: "contributions", entityId: data.id, afterData: data });
-    res.json({ ok: true, id: data.id });
-  } catch (err) {
-    console.error("create contribution error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
+// ---------- Daily Cost Journal: Materials ----------
+app.post("/api/daily/materials", requireAuth, attachRole, blockIfAudit, requireRole(["developer", "admin"]), upload.single("receipt"), async (req, res) => {
+  const { entry_date, items = [] } = req.body;
+  if (!entry_date) return res.status(400).json({ error: "entry_date required" });
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item required" });
 
-app.post("/api/receipts", requireAuth, attachRole, blockIfAudit, requireRole(["developer", "admin"]), async (req, res) => {
-  try {
-    assertPositiveNumber(req.body.kes_received, "kes_received");
-    if (!req.body.contribution_id) throw new Error("contribution_id required");
-    const { contribution_id, kes_received, fx_rate } = req.body;
-    const { data, error } = await supabaseService
-      .from("receipts")
-      .insert({ contribution_id, developer_id: req.user.id, kes_received, fx_rate, approved: false, locked: false })
-      .select()
-      .single();
-    if (error) throw error;
-    await logAudit({ actorId: req.user.id, action: "create", entity: "receipts", entityId: data.id, afterData: data });
-    res.json({ ok: true, id: data.id });
-  } catch (err) {
-    console.error("create receipt error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post("/api/expenses", requireAuth, attachRole, blockIfAudit, requireRole(["developer", "admin"]), async (req, res) => {
-  try {
-    assertPositiveNumber(req.body.amount_kes, "amount_kes");
-    assertIn(req.body.category, ["labour", "materials", "other"], "category");
-    if (!req.body.expense_date) throw new Error("expense_date required");
-    const { amount_kes, category, expense_date, description, receipt_url } = req.body;
-    const { data, error } = await supabaseService
-      .from("expenses")
-      .insert({ developer_id: req.user.id, amount_kes, category, expense_date, description, receipt_url, locked: false })
-      .select()
-      .single();
-    if (error) throw error;
-    await logAudit({ actorId: req.user.id, action: "create", entity: "expenses", entityId: data.id, afterData: data });
-    res.json({ ok: true, id: data.id });
-  } catch (err) {
-    console.error("create expense error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post("/api/admin/receipts/:id/approve", requireAuth, attachRole, blockIfAudit, requireRole(["admin"]), async (req, res) => {
-  try {
-    const { data: before } = await supabaseService.from("receipts").select("*").eq("id", req.params.id).single();
-    const { error } = await supabaseService.from("receipts").update({ approved: true }).eq("id", req.params.id);
-    if (error) throw error;
-    await logAudit({
-      actorId: req.user.id,
-      action: "approve",
-      entity: "receipts",
-      entityId: req.params.id,
-      beforeData: before,
-      afterData: { ...before, approved: true }
+  // upload receipt if file present (pdf only)
+  let receiptPath = null;
+  if (req.file) {
+    const ext = req.file.originalname.split(".").pop().toLowerCase();
+    if (ext !== "pdf") return res.status(400).json({ error: "Only PDF receipts allowed" });
+    const path = `receipts/${req.user.id}/${Date.now()}-${req.file.originalname}`;
+    const { error } = await supabaseService.storage.from(SUPABASE_STORAGE_BUCKET).upload(path, req.file.buffer, {
+      contentType: req.file.mimetype,
+      upsert: false
     });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("approve receipt error:", err);
-    res.status(400).json({ error: err.message });
+    if (error) return res.status(400).json({ error: error.message });
+    receiptPath = path;
   }
-});
 
-// ---------- Locks & Soft-delete ----------
-app.post("/api/admin/:table/:id/lock", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
-  const { table, id } = req.params;
-  if (!["contributions", "receipts", "expenses"].includes(table)) return res.status(400).json({ error: "Invalid table" });
   try {
-    const { data: before } = await supabaseService.from(table).select("*").eq("id", id).single();
-    const { error } = await supabaseService.from(table).update({ locked: true }).eq("id", id);
-    if (error) throw error;
-    await logAudit({ actorId: req.user.id, action: "lock", entity: table, entityId: id, beforeData: before, afterData: { ...before, locked: true } });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("lock error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post("/api/admin/:table/:id/soft-delete", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
-  const { table, id } = req.params;
-  if (!["contributions", "receipts", "expenses", "expense_comments"].includes(table)) {
-    return res.status(400).json({ error: "Invalid table" });
-  }
-  try {
-    const { data: before } = await supabaseService.from(table).select("*").eq("id", id).single();
-    const ts = new Date().toISOString();
-    const { error } = await supabaseService.from(table).update({ deleted_at: ts }).eq("id", id);
-    if (error) throw error;
-    await logAudit({
-      actorId: req.user.id,
-      action: "soft_delete",
-      entity: table,
-      entityId: id,
-      beforeData: before,
-      afterData: { ...before, deleted_at: ts }
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("soft delete error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// ---------- Flags & Comments ----------
-app.post("/api/expenses/:id/flag", requireAuth, attachRole, blockIfAudit, requireRole(["investor", "admin"]), async (req, res) => {
-  const { flagged = true } = req.body;
-  try {
-    const { data: before } = await supabaseService.from("expenses").select("*").eq("id", req.params.id).single();
-    const { error } = await supabaseService.from("expenses").update({ flagged }).eq("id", req.params.id);
-    if (error) throw error;
-    await logAudit({
-      actorId: req.user.id,
-      action: flagged ? "flag" : "unflag",
-      entity: "expenses",
-      entityId: req.params.id,
-      beforeData: before,
-      afterData: { ...before, flagged }
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("flag expense error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post("/api/expenses/:id/comments", requireAuth, attachRole, blockIfAudit, requireRole(["investor", "admin", "developer"]), async (req, res) => {
-  const { comment } = req.body;
-  if (!comment) return res.status(400).json({ error: "comment required" });
-  try {
-    const { data, error } = await supabaseService
-      .from("expense_comments")
-      .insert({ expense_id: req.params.id, commenter_id: req.user.id, comment })
+    // create entry
+    const { data: entry, error: entryErr } = await supabaseService
+      .from("material_entries")
+      .insert({ developer_id: req.user.id, entry_date, receipt_path: receiptPath })
       .select()
       .single();
-    if (error) throw error;
-    await logAudit({ actorId: req.user.id, action: "comment", entity: "expense_comments", entityId: data.id, afterData: data });
-    res.json({ ok: true, id: data.id });
+    if (entryErr) throw entryErr;
+
+    // insert items
+    const rows = items.map((it) => ({
+      entry_id: entry.id,
+      description: it.description,
+      supplier: it.supplier || null,
+      quantity: Number(it.quantity),
+      unit_cost: Number(it.unit_cost)
+    }));
+    if (rows.some((r) => !(r.description && r.quantity > 0 && r.unit_cost > 0))) {
+      return res.status(400).json({ error: "Invalid item data" });
+    }
+    const { data: insertedItems, error: itemErr } = await supabaseService.from("material_items").insert(rows).select();
+    if (itemErr) throw itemErr;
+
+    // sum total
+    const totalCost = insertedItems.reduce((sum, r) => sum + Number(r.total_cost || 0), 0);
+
+    // ledger expense
+    const { error: expErr } = await supabaseService.from("expenses").insert({
+      developer_id: req.user.id,
+      amount_kes: totalCost, // assume KES; adjust if FX needed
+      category: "materials",
+      expense_date: entry_date,
+      description: `Materials for ${entry_date}`,
+      receipt_url: receiptPath,
+      locked: isLocked(entry.created_at)
+    });
+    if (expErr) throw expErr;
+
+    await logAudit({ actorId: req.user.id, action: "create", entity: "material_entries", entityId: entry.id, afterData: { entry, items: insertedItems } });
+    res.json({ ok: true, entry, items: insertedItems, total_cost: totalCost });
   } catch (err) {
-    console.error("comment error:", err);
+    console.error("materials create error:", err);
     res.status(400).json({ error: err.message });
   }
 });
 
-app.get("/api/expenses/:id/comments", requireAuth, attachRole, async (req, res) => {
+app.get("/api/daily/materials", requireAuth, attachRole, async (req, res) => {
   try {
-    const { data, error } = await supabaseService
-      .from("expense_comments")
-      .select("*")
-      .eq("expense_id", req.params.id)
-      .eq("deleted_at", null)
-      .order("created_at", { ascending: false });
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    console.error("list comments error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+    const { page, limit, offset } = paginationParams(req, 10);
+    const { startDate, endDate } = req.query;
 
-// ---------- Lists with filters/pagination ----------
-function dateRange(q) {
-  const { startDate, endDate } = q;
-  return { startDate, endDate };
-}
-
-app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
-  try {
-    const { page, limit, offset } = paginationParams(req);
-    const { startDate, endDate, status } = req.query;
     let query = supabaseService
-      .from("contributions")
-      .select("*", { count: "exact" })
+      .from("material_entries")
+      .select("*, material_items(*)", { count: "exact" })
       .eq("deleted_at", null)
-      .order("created_at", { ascending: false })
+      .order("entry_date", { ascending: false })
       .range(offset, offset + limit - 1);
 
-    if (startDate) query = query.gte("created_at", startDate);
-    if (endDate) query = query.lte("created_at", endDate);
-    if (status) query = query.eq("status", status);
-
-    if (req.user.app_role === "investor") query = query.eq("investor_id", req.user.id);
-    else if (req.user.app_role !== "admin") return res.status(403).json({ error: "Forbidden" });
-
-    const { data, error, count } = await query;
-    if (error) throw error;
-    res.json({ data, page, limit, total: count });
-  } catch (err) {
-    console.error("list contributions error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
-  try {
-    const { page, limit, offset } = paginationParams(req);
-    const { startDate, endDate, status } = req.query; // status -> approved (true/false)
-    let query = supabaseService
-      .from("receipts")
-      .select("*", { count: "exact" })
-      .eq("deleted_at", null)
-      .order("created_at", { ascending: false })
-      .range(offset, offset + limit - 1);
-
-    if (startDate) query = query.gte("created_at", startDate);
-    if (endDate) query = query.lte("created_at", endDate);
-    if (status === "approved") query = query.eq("approved", true);
-    if (status === "pending") query = query.eq("approved", false);
-
-    if (req.user.app_role === "developer") query = query.eq("developer_id", req.user.id);
-    else if (req.user.app_role !== "admin") return res.status(403).json({ error: "Forbidden" });
-
-    const { data, error, count } = await query;
-    if (error) throw error;
-    res.json({ data, page, limit, total: count });
-  } catch (err) {
-    console.error("list receipts error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
-  try {
-    const { page, limit, offset } = paginationParams(req);
-    const { startDate, endDate, category, status } = req.query; // status -> flagged true/false
-    let query = supabaseService
-      .from("expenses")
-      .select("*", { count: "exact" })
-      .eq("deleted_at", null)
-      .order("created_at", { ascending: false })
-      .range(offset, offset + limit - 1);
-
-    if (startDate) query = query.gte("expense_date", startDate);
-    if (endDate) query = query.lte("expense_date", endDate);
-    if (category) query = query.eq("category", category);
-    if (status === "flagged") query = query.eq("flagged", true);
-    if (status === "clean") query = query.eq("flagged", false);
-
+    if (startDate) query = query.gte("entry_date", startDate);
+    if (endDate) query = query.lte("entry_date", endDate);
     if (req.user.app_role === "developer") query = query.eq("developer_id", req.user.id);
     else if (req.user.app_role !== "admin" && req.user.app_role !== "investor") return res.status(403).json({ error: "Forbidden" });
 
     const { data, error, count } = await query;
     if (error) throw error;
-    res.json({ data, page, limit, total: count });
+
+    // include total per entry
+    const withTotals = (data || []).map((e) => ({
+      ...e,
+      total_cost: (e.material_items || []).reduce((sum, it) => sum + Number(it.total_cost || 0), 0),
+      editable: !isLocked(e.created_at) || req.user.app_role === "admin"
+    }));
+
+    res.json({ data: withTotals, page, limit, total: count });
   } catch (err) {
-    console.error("list expenses error:", err);
+    console.error("materials list error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---------- Reporting helper ----------
-async function getReports({ startDate, endDate } = {}) {
-  const { data: balances, error: balErr } = await supabaseService.from("balances").select("*").single();
-  if (balErr) throw balErr;
+// ---------- Daily Cost Journal: Labour ----------
+app.post("/api/daily/labour", requireAuth, attachRole, blockIfAudit, requireRole(["developer", "admin"]), async (req, res) => {
+  const { entry_date, workers = [] } = req.body;
+  if (!entry_date) return res.status(400).json({ error: "entry_date required" });
+  if (!Array.isArray(workers) || workers.length === 0) return res.status(400).json({ error: "At least one labourer required" });
 
-  const { data: contribs, error: cErr } = await supabaseService.rpc("report_contributions_by_investor");
-  if (cErr) throw cErr;
-
-  const { data: expensesByCat, error: eErr } = await supabaseService.rpc("report_expenses_by_category");
-  if (eErr) throw eErr;
-
-  const { data: monthlyCash, error: mErr } = await supabaseService.rpc("report_monthly_cashflow");
-  if (mErr) throw mErr;
-
-  return { balances, contribs, expensesByCat, monthlyCash };
-}
-
-// ---------- Reporting endpoints ----------
-app.get("/api/reports/summary", requireAuth, attachRole, requireRole(["admin", "investor", "developer"]), async (req, res) => {
   try {
-    const { startDate, endDate } = req.query;
-    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate });
-    res.json({ balances, contributions_by_investor: contribs, expenses_by_category: expensesByCat, monthly_cashflow: monthlyCash });
-  } catch (err) {
-    console.error("report summary error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+    const { data: entry, error: entryErr } = await supabaseService
+      .from("labour_entries")
+      .insert({ developer_id: req.user.id, entry_date })
+      .select()
+      .single();
+    if (entryErr) throw entryErr;
 
-// ---------- Exports ----------
-app.get("/api/export/excel", requireAuth, attachRole, requireRole(["admin"]), async (_req, res) => {
-  try {
-    const { balances, contribs, expensesByCat, monthlyCash } = await getReports();
-    const wb = new ExcelJS.Workbook();
-    wb.creator = "BrickLedger";
-    const sheet = wb.addWorksheet("Summary");
+    const rows = workers.map((w) => ({
+      entry_id: entry.id,
+      labourer_name: w.labourer_name,
+      role: w.role || null,
+      rate_per_day: Number(w.rate_per_day),
+      total_paid: Number(w.total_paid)
+    }));
+    if (rows.some((r) => !(r.labourer_name && r.rate_per_day > 0 && r.total_paid > 0))) {
+      return res.status(400).json({ error: "Invalid labour item data" });
+    }
 
-    sheet.addRow(["Balances"]);
-    sheet.addRow(["Total Received KES", balances.total_received_kes]);
-    sheet.addRow(["Total Expenses KES", balances.total_expenses_kes]);
-    sheet.addRow(["Balance KES", balances.balance_kes]);
-    sheet.addRow([]);
-    sheet.addRow(["Contributions by Investor (GBP)"]);
-    sheet.addRow(["Investor", "Total GBP"]);
-    contribs.forEach((c) => sheet.addRow([c.investor_name || c.investor_id, c.total_gbp]));
-    sheet.addRow([]);
-    sheet.addRow(["Expenses by Category"]);
-    sheet.addRow(["Category", "Total KES"]);
-    expensesByCat.forEach((e) => sheet.addRow([e.category, e.total_kes]));
-    sheet.addRow([]);
-    sheet.addRow(["Monthly Cashflow"]);
-    sheet.addRow(["Month", "Inflow KES", "Outflow KES", "Net KES"]);
-    monthlyCash.forEach((m) => sheet.addRow([m.month, m.inflow_kes, m.outflow_kes, m.net_kes]));
+    const { data: inserted, error: insErr } = await supabaseService.from("labour_items").insert(rows).select();
+    if (insErr) throw insErr;
 
-    const buffer = await wb.xlsx.writeBuffer();
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", 'attachment; filename="brickledger_financials.xlsx"');
-    res.send(Buffer.from(buffer));
-  } catch (err) {
-    console.error("excel export error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+    const totalPaid = inserted.reduce((sum, r) => sum + Number(r.total_paid || 0), 0);
 
-app.get("/api/export/pdf", requireAuth, attachRole, requireRole(["admin"]), async (_req, res) => {
-  try {
-    const { balances, contribs, expensesByCat, monthlyCash } = await getReports();
-    const doc = new PDFDocument();
-    const bufferStream = new streamBuffers.WritableStreamBuffer();
-
-    doc.fontSize(18).text("BrickLedger Financials", { underline: true });
-    doc.moveDown();
-    doc.fontSize(12).text(`Total Received (KES): ${balances.total_received_kes}`);
-    doc.text(`Total Expenses (KES): ${balances.total_expenses_kes}`);
-    doc.text(`Balance (KES): ${balances.balance_kes}`);
-    doc.moveDown();
-
-    doc.fontSize(14).text("Contributions by Investor (GBP)");
-    contribs.forEach((c) => doc.fontSize(11).text(`${c.investor_name || c.investor_id}: GBP ${c.total_gbp}`));
-    doc.moveDown();
-
-    doc.fontSize(14).text("Expenses by Category");
-    expensesByCat.forEach((e) => doc.fontSize(11).text(`${e.category}: KES ${e.total_kes}`));
-    doc.moveDown();
-
-    doc.fontSize(14).text("Monthly Cashflow");
-    monthlyCash.forEach((m) =>
-      doc.fontSize(11).text(`${m.month}: inflow ${m.inflow_kes}, outflow ${m.outflow_kes}, net ${m.net_kes}`)
-    );
-
-    doc.end();
-    doc.pipe(bufferStream);
-    bufferStream.on("finish", () => {
-      const pdfData = bufferStream.getBuffer();
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", 'attachment; filename="brickledger_financials.pdf"');
-      res.send(pdfData);
+    const { error: expErr } = await supabaseService.from("expenses").insert({
+      developer_id: req.user.id,
+      amount_kes: totalPaid,
+      category: "labour",
+      expense_date: entry_date,
+      description: `Labour for ${entry_date}`,
+      locked: isLocked(entry.created_at)
     });
+    if (expErr) throw expErr;
+
+    await logAudit({ actorId: req.user.id, action: "create", entity: "labour_entries", entityId: entry.id, afterData: { entry, workers: inserted } });
+    res.json({ ok: true, entry, workers: inserted, total_paid: totalPaid });
   } catch (err) {
-    console.error("pdf export error:", err);
+    console.error("labour create error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get("/api/daily/labour", requireAuth, attachRole, async (req, res) => {
+  try {
+    const { page, limit, offset } = paginationParams(req, 10);
+    const { startDate, endDate } = req.query;
+
+    let query = supabaseService
+      .from("labour_entries")
+      .select("*, labour_items(*)", { count: "exact" })
+      .eq("deleted_at", null)
+      .order("entry_date", { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (startDate) query = query.gte("entry_date", startDate);
+    if (endDate) query = query.lte("entry_date", endDate);
+    if (req.user.app_role === "developer") query = query.eq("developer_id", req.user.id);
+    else if (req.user.app_role !== "admin" && req.user.app_role !== "investor") return res.status(403).json({ error: "Forbidden" });
+
+    const { data, error, count } = await query;
+    if (error) throw error;
+
+    const withTotals = (data || []).map((e) => ({
+      ...e,
+      total_paid: (e.labour_items || []).reduce((sum, it) => sum + Number(it.total_paid || 0), 0),
+      editable: !isLocked(e.created_at) || req.user.app_role === "admin"
+    }));
+
+    res.json({ data: withTotals, page, limit, total: count });
+  } catch (err) {
+    console.error("labour list error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---------- Signed URL for receipt/expense files ----------
+// ---------- Signed URL for receipts ----------
 app.get("/api/expenses/:id/receipt-url", requireAuth, attachRole, async (req, res) => {
   try {
     const { data: exp, error } = await supabaseService.from("expenses").select("receipt_url").eq("id", req.params.id).single();
@@ -524,35 +336,102 @@ app.get("/api/expenses/:id/receipt-url", requireAuth, attachRole, async (req, re
   }
 });
 
-app.post(
-  "/api/uploads/receipt",
-  requireAuth,
-  attachRole,
-  blockIfAudit,
-  requireRole(["developer", "admin"]),
-  upload.single("file"),
-  async (req, res) => {
-    try {
-      if (!req.file) throw new Error("File is required");
-      const ext = req.file.originalname.split(".").pop().toLowerCase();
-      if (!["pdf", "png", "jpg", "jpeg", "webp"].includes(ext)) {
-        throw new Error("Unsupported file type");
-      }
-      const path = `receipts/${req.user.id}/${Date.now()}-${req.file.originalname}`;
-      const { error } = await supabaseService.storage.from(SUPABASE_STORAGE_BUCKET).upload(path, req.file.buffer, {
-        contentType: req.file.mimetype,
-        upsert: false
-      });
-      if (error) throw error;
-      const { data: publicUrl } = supabaseService.storage.from(SUPABASE_STORAGE_BUCKET).getPublicUrl(path);
-      res.json({ ok: true, path, publicUrl: publicUrl.publicUrl });
-    } catch (err) {
-      console.error("upload error:", err);
-      res.status(400).json({ error: err.message });
-    }
-  }
-);
+// ---------- Analytics: Heatmap + Summary ----------
+app.get("/api/daily/summary", requireAuth, attachRole, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const expQuery = supabaseService
+      .from("expenses")
+      .select("expense_date, amount_kes, category")
+      .eq("deleted_at", null);
 
+    if (startDate) expQuery.gte("expense_date", startDate);
+    if (endDate) expQuery.lte("expense_date", endDate);
+    if (req.user.app_role === "developer") expQuery.eq("developer_id", req.user.id);
+
+    const { data, error } = await expQuery;
+    if (error) throw error;
+
+    const byDate = {};
+    let materials = 0, labour = 0, other = 0;
+    data.forEach((d) => {
+      const amt = Number(d.amount_kes || 0);
+      const key = d.expense_date;
+      byDate[key] = (byDate[key] || 0) + amt;
+      if (d.category === "materials") materials += amt;
+      else if (d.category === "labour") labour += amt;
+      else other += amt;
+    });
+
+    res.json({
+      totals: { materials, labour, other, combined: materials + labour + other },
+      heatmap: byDate
+    });
+  } catch (err) {
+    console.error("summary error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Excel Export (Daily Journal) ----------
+app.get("/api/daily/export/excel", requireAuth, attachRole, requireRole(["developer", "admin"]), async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+
+    const mQuery = supabaseService
+      .from("material_entries")
+      .select("entry_date, material_items(description, supplier, quantity, unit_cost, total_cost)")
+      .eq("deleted_at", null)
+      .order("entry_date", { ascending: true });
+    if (startDate) mQuery.gte("entry_date", startDate);
+    if (endDate) mQuery.lte("entry_date", endDate);
+    if (req.user.app_role === "developer") mQuery.eq("developer_id", req.user.id);
+    const { data: materials, error: mErr } = await mQuery;
+    if (mErr) throw mErr;
+
+    const lQuery = supabaseService
+      .from("labour_entries")
+      .select("entry_date, labour_items(labourer_name, role, rate_per_day, total_paid)")
+      .eq("deleted_at", null)
+      .order("entry_date", { ascending: true });
+    if (startDate) lQuery.gte("entry_date", startDate);
+    if (endDate) lQuery.lte("entry_date", endDate);
+    if (req.user.app_role === "developer") lQuery.eq("developer_id", req.user.id);
+    const { data: labour, error: lErr } = await lQuery;
+    if (lErr) throw lErr;
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = "BrickLedger";
+
+    // Materials sheet
+    const ms = wb.addWorksheet("MATERIAL COST TRACKING");
+    ms.addRow(["Date", "Description", "Supplier", "Qty", "Unit Cost", "Total Cost"]);
+    materials.forEach((e) => {
+      (e.material_items || []).forEach((it) => {
+        ms.addRow([e.entry_date, it.description, it.supplier, it.quantity, it.unit_cost, it.total_cost]);
+      });
+    });
+
+    // Labour sheet
+    const ls = wb.addWorksheet("LABOUR TRACKING");
+    ls.addRow(["Date", "Labourer", "Role", "Rate/Day", "Total Paid"]);
+    labour.forEach((e) => {
+      (e.labour_items || []).forEach((it) => {
+        ls.addRow([e.entry_date, it.labourer_name, it.role, it.rate_per_day, it.total_paid]);
+      });
+    });
+
+    const buffer = await wb.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", 'attachment; filename="brickledger_daily_journal.xlsx"');
+    res.send(Buffer.from(buffer));
+  } catch (err) {
+    console.error("excel export daily error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`API listening on port ${PORT}`);
 });
