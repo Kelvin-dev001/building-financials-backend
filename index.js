@@ -18,7 +18,8 @@ const {
   SUPABASE_ANON_KEY,
   SUPABASE_STORAGE_BUCKET = "receipts",
   PORT = 10000,
-  AUDIT_MODE = "false"
+  AUDIT_MODE = "false",
+  CORS_ALLOW_ORIGINS = "*"
 } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !SUPABASE_ANON_KEY) {
@@ -32,20 +33,19 @@ const auditMode = AUDIT_MODE === "true";
 
 const app = express();
 app.use(helmet());
-app.use(compression());
 app.use(
   cors({
-    origin: "*",
+    origin: CORS_ALLOW_ORIGINS === "*" ? "*" : CORS_ALLOW_ORIGINS.split(","),
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"]
   })
 );
-app.use(express.json({ limit: "2mb" }));
+app.use(compression());
+app.use(express.json());
 app.use(morgan("dev"));
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } }); // 8MB
 
-// ---- Helpers ----
 async function requireAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization || "";
@@ -114,28 +114,24 @@ async function logAudit({ actorId, action, entity, entityId, beforeData = null, 
   }
 }
 
-// Validation
 function assertPositiveNumber(value, name) {
-  if (value === undefined || value === null || Number(value) <= 0) throw new Error(`${name} must be > 0`);
+  if (value === undefined || value === null || Number(value) <= 0) {
+    throw new Error(`${name} must be > 0`);
+  }
 }
 function assertIn(value, allowed, name) {
   if (!allowed.includes(value)) throw new Error(`${name} must be one of: ${allowed.join(", ")}`);
 }
 
-// Pagination + filters
-function buildPagination(req, defaultLimit = 10, maxLimit = 50) {
-  const page = Math.max(1, Number(req.query.page || 1));
-  const limit = Math.min(maxLimit, Math.max(1, Number(req.query.limit || defaultLimit)));
-  const offset = (page - 1) * limit;
-  return { page, limit, offset };
-}
-function addDateRange(query, req, column = "created_at") {
-  const { startDate, endDate } = req.query;
-  if (startDate) query.gte(column, startDate);
-  if (endDate) query.lte(column, endDate);
+function paginateQuery(query, page = 1, limit = 20) {
+  const p = Math.max(1, Number(page) || 1);
+  const l = Math.min(100, Math.max(1, Number(limit) || 20));
+  const from = (p - 1) * l;
+  const to = from + l - 1;
+  return { query: query.range(from, to), page: p, limit: l };
 }
 
-// Health
+// ---------- Health ----------
 app.get("/health", async (_req, res) => {
   try {
     const { data, error } = await supabaseService.from("balances").select("*").limit(1);
@@ -147,7 +143,7 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// Auth info
+// ---------- Auth info ----------
 app.get("/api/ping", (_req, res) => res.json({ message: "pong" }));
 app.get("/api/me", requireAuth, attachRole, (req, res) => {
   res.json({
@@ -155,28 +151,23 @@ app.get("/api/me", requireAuth, attachRole, (req, res) => {
     email: req.user.email,
     full_name: req.user.full_name,
     role: req.user.app_role || null,
-    audit_mode: auditMode
+    audit_mode: auditMode,
+    last_sign_in_at: req.user.last_sign_in_at
   });
 });
 app.get("/api/admin/check", requireAuth, attachRole, requireRole(["admin"]), (_req, res) => {
   res.json({ ok: true, message: "Admin access confirmed" });
 });
 
-// Core flows
+// ---------- Core flows ----------
 app.post("/api/contributions", requireAuth, attachRole, blockIfAudit, requireRole(["investor", "admin"]), async (req, res) => {
   try {
     assertPositiveNumber(req.body.gbp_amount, "gbp_amount");
-    const { gbp_amount, note, sent_at } = req.body;
+    if (!req.body.date_sent) throw new Error("date_sent required");
+    const { gbp_amount, note, date_sent } = req.body;
     const { data, error } = await supabaseService
       .from("contributions")
-      .insert({
-        investor_id: req.user.id,
-        gbp_amount,
-        note,
-        status: "pending",
-        locked: false,
-        sent_at: sent_at || new Date().toISOString()
-      })
+      .insert({ investor_id: req.user.id, gbp_amount, note, status: "pending", locked: false, date_sent })
       .select()
       .single();
     if (error) throw error;
@@ -238,7 +229,7 @@ app.post("/api/admin/receipts/:id/approve", requireAuth, attachRole, blockIfAudi
       entity: "receipts",
       entityId: req.params.id,
       beforeData: before,
-      afterData: { ...before, approved: true, confirmed_at: new Date().toISOString() }
+      afterData: { ...before, approved: true }
     });
     res.json({ ok: true });
   } catch (err) {
@@ -247,7 +238,7 @@ app.post("/api/admin/receipts/:id/approve", requireAuth, attachRole, blockIfAudi
   }
 });
 
-// Locks
+// ---------- Locks (admin) ----------
 app.post("/api/admin/:table/:id/lock", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
   const { table, id } = req.params;
   if (!["contributions", "receipts", "expenses"].includes(table)) return res.status(400).json({ error: "Invalid table" });
@@ -270,7 +261,7 @@ app.post("/api/admin/:table/:id/lock", requireAuth, attachRole, requireRole(["ad
   }
 });
 
-// Soft delete
+// ---------- Soft delete (admin) ----------
 app.post("/api/admin/:table/:id/soft-delete", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
   const { table, id } = req.params;
   if (!["contributions", "receipts", "expenses", "expense_comments"].includes(table)) {
@@ -296,7 +287,7 @@ app.post("/api/admin/:table/:id/soft-delete", requireAuth, attachRole, requireRo
   }
 });
 
-// Flags & Comments
+// ---------- Flags & Comments ----------
 app.post("/api/expenses/:id/flag", requireAuth, attachRole, blockIfAudit, requireRole(["investor", "admin"]), async (req, res) => {
   const { flagged = true } = req.body;
   try {
@@ -342,25 +333,30 @@ app.post("/api/expenses/:id/comments", requireAuth, attachRole, blockIfAudit, re
   }
 });
 
-// Lists with filters/pagination
+// ---------- Lists (filter deleted_at) with pagination & filters ----------
 app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
   try {
-    const { limit, offset, page } = buildPagination(req);
-    let query = supabaseService
-      .from("contributions")
-      .select("*", { count: "exact" })
-      .eq("deleted_at", null)
-      .order("created_at", { ascending: false })
-      .range(offset, offset + limit - 1);
+    const { page, limit, startDate, endDate, status } = req.query;
+    let base = supabaseService.from("contributions").select("*").eq("deleted_at", null).order("created_at", { ascending: false });
 
-    addDateRange(query, req, "created_at");
-    if (req.query.status) query = query.eq("status", req.query.status);
-    if (req.user.app_role === "investor") query = query.eq("investor_id", req.user.id);
-    else if (req.user.app_role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (startDate) base = base.gte("date_sent", startDate);
+    if (endDate) base = base.lte("date_sent", endDate);
+    if (status) base = base.eq("status", status);
 
-    const { data, error, count } = await query;
-    if (error) throw error;
-    res.json({ data, page, total: count });
+    if (req.user.app_role === "admin") {
+      const { query } = paginateQuery(base, page, limit);
+      const { data, error } = await query;
+      if (error) throw error;
+      return res.json(data);
+    }
+    if (req.user.app_role === "investor") {
+      const scoped = base.eq("investor_id", req.user.id);
+      const { query } = paginateQuery(scoped, page, limit);
+      const { data, error } = await query;
+      if (error) throw error;
+      return res.json(data);
+    }
+    return res.status(403).json({ error: "Forbidden" });
   } catch (err) {
     console.error("list contributions error:", err);
     res.status(500).json({ error: err.message });
@@ -369,23 +365,29 @@ app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
 
 app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
   try {
-    const { limit, offset, page } = buildPagination(req);
-    let query = supabaseService
-      .from("receipts")
-      .select("*", { count: "exact" })
-      .eq("deleted_at", null)
-      .order("created_at", { ascending: false })
-      .range(offset, offset + limit - 1);
+    const { page, limit, startDate, endDate, status } = req.query;
+    let base = supabaseService.from("receipts").select("*").eq("deleted_at", null).order("created_at", { ascending: false });
+    if (startDate) base = base.gte("created_at", startDate);
+    if (endDate) base = base.lte("created_at", endDate);
+    if (status) {
+      if (status === "approved") base = base.eq("approved", true);
+      if (status === "pending") base = base.eq("approved", false);
+    }
 
-    addDateRange(query, req, "created_at");
-    if (req.query.status === "approved") query = query.eq("approved", true);
-    if (req.query.status === "pending") query = query.eq("approved", false);
-    if (req.user.app_role === "developer") query = query.eq("developer_id", req.user.id);
-    else if (req.user.app_role !== "admin") return res.status(403).json({ error: "Forbidden" });
-
-    const { data, error, count } = await query;
-    if (error) throw error;
-    res.json({ data, page, total: count });
+    if (req.user.app_role === "admin") {
+      const { query } = paginateQuery(base, page, limit);
+      const { data, error } = await query;
+      if (error) throw error;
+      return res.json(data);
+    }
+    if (req.user.app_role === "developer") {
+      const scoped = base.eq("developer_id", req.user.id);
+      const { query } = paginateQuery(scoped, page, limit);
+      const { data, error } = await query;
+      if (error) throw error;
+      return res.json(data);
+    }
+    return res.status(403).json({ error: "Forbidden" });
   } catch (err) {
     console.error("list receipts error:", err);
     res.status(500).json({ error: err.message });
@@ -394,60 +396,57 @@ app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
 
 app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
   try {
-    const { limit, offset, page } = buildPagination(req);
-    let query = supabaseService
-      .from("expenses")
-      .select("*", { count: "exact" })
-      .eq("deleted_at", null)
-      .order("created_at", { ascending: false })
-      .range(offset, offset + limit - 1);
+    const { page, limit, startDate, endDate, status, category } = req.query;
+    let base = supabaseService.from("expenses").select("*").eq("deleted_at", null).order("created_at", { ascending: false });
+    if (startDate) base = base.gte("expense_date", startDate);
+    if (endDate) base = base.lte("expense_date", endDate);
+    if (category) base = base.eq("category", category);
+    if (status) {
+      if (status === "flagged") base = base.eq("flagged", true);
+      if (status === "unflagged") base = base.eq("flagged", false);
+    }
 
-    addDateRange(query, req, "expense_date");
-    if (req.query.category) query = query.eq("category", req.query.category);
-    if (req.query.flagged === "true") query = query.eq("flagged", true);
-    if (req.user.app_role === "developer") query = query.eq("developer_id", req.user.id);
-    else if (req.user.app_role !== "admin") return res.status(403).json({ error: "Forbidden" });
-
-    const { data, error, count } = await query;
-    if (error) throw error;
-    res.json({ data, page, total: count });
+    if (req.user.app_role === "admin") {
+      const { query } = paginateQuery(base, page, limit);
+      const { data, error } = await query;
+      if (error) throw error;
+      return res.json(data);
+    }
+    if (req.user.app_role === "developer") {
+      const scoped = base.eq("developer_id", req.user.id);
+      const { query } = paginateQuery(scoped, page, limit);
+      const { data, error } = await query;
+      if (error) throw error;
+      return res.json(data);
+    }
+    return res.status(403).json({ error: "Forbidden" });
   } catch (err) {
     console.error("list expenses error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Reporting helper
-async function getReports({ startDate, endDate }) {
-  const { data: balances, error: balErr } = await supabaseService.from("balances").select("*").single();
+// ---------- Reporting helper ----------
+async function getReports(filters = {}) {
+  const { startDate, endDate, type } = filters;
+  const params = { startDate, endDate, type };
+  const { data: balances, error: balErr } = await supabaseService.rpc("report_balances_filtered", params);
   if (balErr) throw balErr;
-
-  const { data: contribs, error: cErr } = await supabaseService.rpc("report_contributions_by_investor_gbp", {
-    p_start: startDate || null,
-    p_end: endDate || null
-  });
+  const { data: contribs, error: cErr } = await supabaseService.rpc("report_contributions_by_investor", params);
   if (cErr) throw cErr;
-
-  const { data: expensesByCat, error: eErr } = await supabaseService.rpc("report_expenses_by_category", {
-    p_start: startDate || null,
-    p_end: endDate || null
-  });
+  const { data: expensesByCat, error: eErr } = await supabaseService.rpc("report_expenses_by_category", params);
   if (eErr) throw eErr;
-
-  const { data: monthlyCash, error: mErr } = await supabaseService.rpc("report_monthly_cashflow", {
-    p_start: startDate || null,
-    p_end: endDate || null
-  });
+  const { data: monthlyCash, error: mErr } = await supabaseService.rpc("report_monthly_cashflow", params);
   if (mErr) throw mErr;
 
   return { balances, contribs, expensesByCat, monthlyCash };
 }
 
-// Reports endpoint with filters
+// ---------- Reporting endpoints ----------
 app.get("/api/reports/summary", requireAuth, attachRole, requireRole(["admin", "investor", "developer"]), async (req, res) => {
   try {
-    const { startDate, endDate } = req.query;
-    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate });
+    const { startDate, endDate, type } = req.query;
+    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate, type });
     res.json({ balances, contributions_by_investor: contribs, expenses_by_category: expensesByCat, monthly_cashflow: monthlyCash });
   } catch (err) {
     console.error("report summary error:", err);
@@ -455,29 +454,30 @@ app.get("/api/reports/summary", requireAuth, attachRole, requireRole(["admin", "
   }
 });
 
-// Exports
+// ---------- Exports ----------
 app.get("/api/export/excel", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
   try {
-    const { startDate, endDate } = req.query;
-    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate });
+    const { startDate, endDate, type } = req.query;
+    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate, type });
     const wb = new ExcelJS.Workbook();
     wb.creator = "BrickLedger";
     const sheet = wb.addWorksheet("Summary");
 
     sheet.addRow(["Balances"]);
     sheet.addRow(["Total Received KES", balances.total_received_kes]);
+    sheet.addRow(["Total Contributions GBP", balances.total_contributions_gbp]);
     sheet.addRow(["Total Expenses KES", balances.total_expenses_kes]);
     sheet.addRow(["Balance KES", balances.balance_kes]);
     sheet.addRow([]);
-    sheet.addRow(["Contributions by Investor (GBP)"]);
+    sheet.addRow(["Contributions by Investor"]);
     sheet.addRow(["Investor", "Total GBP"]);
     contribs.forEach((c) => sheet.addRow([c.investor_name || c.investor_id, c.total_gbp]));
     sheet.addRow([]);
-    sheet.addRow(["Expenses by Category (KES)"]);
+    sheet.addRow(["Expenses by Category"]);
     sheet.addRow(["Category", "Total KES"]);
     expensesByCat.forEach((e) => sheet.addRow([e.category, e.total_kes]));
     sheet.addRow([]);
-    sheet.addRow(["Monthly Cashflow (KES)"]);
+    sheet.addRow(["Monthly Cashflow"]);
     sheet.addRow(["Month", "Inflow KES", "Outflow KES", "Net KES"]);
     monthlyCash.forEach((m) => sheet.addRow([m.month, m.inflow_kes, m.outflow_kes, m.net_kes]));
 
@@ -493,27 +493,28 @@ app.get("/api/export/excel", requireAuth, attachRole, requireRole(["admin"]), as
 
 app.get("/api/export/pdf", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
   try {
-    const { startDate, endDate } = req.query;
-    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate });
+    const { startDate, endDate, type } = req.query;
+    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate, type });
     const doc = new PDFDocument();
     const bufferStream = new streamBuffers.WritableStreamBuffer();
 
-    doc.fontSize(18).text("BrickLedger Report", { underline: true });
+    doc.fontSize(18).text("BrickLedger Financial Report", { underline: true });
     doc.moveDown();
     doc.fontSize(12).text(`Total Received (KES): ${balances.total_received_kes}`);
+    doc.text(`Total Contributions (GBP): ${balances.total_contributions_gbp}`);
     doc.text(`Total Expenses (KES): ${balances.total_expenses_kes}`);
     doc.text(`Balance (KES): ${balances.balance_kes}`);
     doc.moveDown();
 
-    doc.fontSize(14).text("Contributions by Investor (GBP)");
+    doc.fontSize(14).text("Contributions by Investor");
     contribs.forEach((c) => doc.fontSize(11).text(`${c.investor_name || c.investor_id}: GBP ${c.total_gbp}`));
     doc.moveDown();
 
-    doc.fontSize(14).text("Expenses by Category (KES)");
+    doc.fontSize(14).text("Expenses by Category");
     expensesByCat.forEach((e) => doc.fontSize(11).text(`${e.category}: KES ${e.total_kes}`));
     doc.moveDown();
 
-    doc.fontSize(14).text("Monthly Cashflow (KES)");
+    doc.fontSize(14).text("Monthly Cashflow");
     monthlyCash.forEach((m) =>
       doc.fontSize(11).text(`${m.month}: inflow ${m.inflow_kes}, outflow ${m.outflow_kes}, net ${m.net_kes}`)
     );
@@ -532,32 +533,23 @@ app.get("/api/export/pdf", requireAuth, attachRole, requireRole(["admin"]), asyn
   }
 });
 
-// Signed URL for receipts
-app.get("/api/receipts/:id/signed-url", requireAuth, attachRole, async (req, res) => {
+// ---------- Admin: audit logs ----------
+app.get("/api/admin/audit-logs", requireAuth, attachRole, requireRole(["admin"]), async (_req, res) => {
   try {
-    const { data: receipt, error } = await supabaseService.from("receipts").select("receipt_path, developer_id").eq("id", req.params.id).single();
-    if (error || !receipt) return res.status(404).json({ error: "Not found" });
-
-    // Allow admin, the developer who uploaded, or any investor (read-only) to view.
-    if (!["admin", "developer", "investor"].includes(req.user.app_role)) return res.status(403).json({ error: "Forbidden" });
-    if (req.user.app_role === "developer" && receipt.developer_id !== req.user.id) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-
-    if (!receipt.receipt_path) return res.status(400).json({ error: "No receipt stored" });
-
-    const { data: signed, error: signErr } = await supabaseService.storage
-      .from(SUPABASE_STORAGE_BUCKET)
-      .createSignedUrl(receipt.receipt_path, 60 * 10); // 10 minutes
-    if (signErr) throw signErr;
-    res.json({ url: signed.signedUrl });
+    const { data, error } = await supabaseService
+      .from("audit_logs")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    res.json(data);
   } catch (err) {
-    console.error("signed url error:", err);
-    res.status(400).json({ error: err.message });
+    console.error("list audit error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Upload receipt (private bucket)
+// ---------- Receipt upload (PDF/image) & signed URL ----------
 app.post(
   "/api/uploads/receipt",
   requireAuth,
@@ -578,7 +570,7 @@ app.post(
         upsert: false
       });
       if (error) throw error;
-      // Save path on receipts if contribution_id provided (optional)
+      // Do NOT make public; use signed URL
       res.json({ ok: true, path });
     } catch (err) {
       console.error("upload error:", err);
@@ -587,7 +579,34 @@ app.post(
   }
 );
 
-// Start
+// Signed URL endpoint (15m default)
+app.get("/api/receipts/:id/signed-url", requireAuth, attachRole, async (req, res) => {
+  try {
+    const { data, error } = await supabaseService.from("receipts").select("id, receipt_path, developer_id, contribution_id").eq("id", req.params.id).single();
+    if (error || !data) return res.status(404).json({ error: "Receipt not found" });
+
+    // AuthZ: developer who uploaded OR admin OR investor owning the contribution
+    if (req.user.app_role === "developer" && req.user.id !== data.developer_id) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    if (req.user.app_role === "investor") {
+      // ensure contribution belongs to investor
+      const { data: contrib } = await supabaseService.from("contributions").select("investor_id").eq("id", data.contribution_id).single();
+      if (!contrib || contrib.investor_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const { data: signed, error: urlErr } = await supabaseService.storage
+      .from(SUPABASE_STORAGE_BUCKET)
+      .createSignedUrl(data.receipt_path, 60 * 15); // 15 minutes
+    if (urlErr) throw urlErr;
+    res.json({ ok: true, url: signed.signedUrl });
+  } catch (err) {
+    console.error("signed url error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`API listening on port ${PORT}`);
 });
