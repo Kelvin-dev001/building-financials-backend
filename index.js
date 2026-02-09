@@ -46,6 +46,8 @@ app.use(morgan("dev"));
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } }); // 8MB
 
+const isValidDate = (v) => v && v !== "null" && v !== "undefined";
+
 async function requireAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization || "";
@@ -187,7 +189,6 @@ app.post("/api/contributions/:id/status", requireAuth, attachRole, blockIfAudit,
     const { data: before, error: readErr } = await supabaseService.from("contributions").select("*").eq("id", req.params.id).single();
     if (readErr || !before) throw readErr || new Error("Contribution not found");
 
-    // (Optional) only allow transition from pending
     if (before.status !== "pending" && status !== "pending") {
       return res.status(400).json({ error: "Only pending contributions can be approved/rejected" });
     }
@@ -214,7 +215,6 @@ app.post("/api/receipts", requireAuth, attachRole, blockIfAudit, requireRole(["d
     assertPositiveNumber(req.body.kes_received, "kes_received");
     if (!req.body.contribution_id) throw new Error("contribution_id required");
     const { contribution_id, kes_received, fx_rate, receipt_path } = req.body;
-    // Optional: enforce contribution must be approved
     const { data: contrib } = await supabaseService.from("contributions").select("status").eq("id", contribution_id).single();
     if (contrib && contrib.status !== "approved") {
       return res.status(400).json({ error: "Contribution must be approved before logging receipt" });
@@ -378,13 +378,11 @@ app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
       .eq("deleted_at", null)
       .order("created_at", { ascending: false });
 
-    if (startDate) base = base.gte("date_sent", startDate);
-    if (endDate) base = base.lte("date_sent", endDate);
+    if (isValidDate(startDate)) base = base.gte("date_sent", startDate);
+    if (isValidDate(endDate)) base = base.lte("date_sent", endDate);
     if (status) base = base.eq("status", status);
     if (investor_id) base = base.eq("investor_id", investor_id);
 
-    // All investors can now read all contributions
-    // Scope still enforced for other roles (admin/developer unrestricted)
     const { query } = paginateQuery(base, page, limit);
     const { data, error, count } = await query;
     if (error) throw error;
@@ -399,14 +397,13 @@ app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
   try {
     const { page, limit, startDate, endDate, status } = req.query;
     let base = supabaseService.from("receipts").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
-    if (startDate) base = base.gte("created_at", startDate);
-    if (endDate) base = base.lte("created_at", endDate);
+    if (isValidDate(startDate)) base = base.gte("created_at", startDate);
+    if (isValidDate(endDate)) base = base.lte("created_at", endDate);
     if (status) {
       if (status === "approved") base = base.eq("approved", true);
       if (status === "pending") base = base.eq("approved", false);
     }
 
-    // Admin/developer: all receipts. Investors: read-only receipts linked to any contribution (per requirement of seeing all contributions)
     const { query } = paginateQuery(base, page, limit);
     const { data, error, count } = await query;
     if (error) throw error;
@@ -421,15 +418,14 @@ app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
   try {
     const { page, limit, startDate, endDate, status, category } = req.query;
     let base = supabaseService.from("expenses").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
-    if (startDate) base = base.gte("expense_date", startDate);
-    if (endDate) base = base.lte("expense_date", endDate);
+    if (isValidDate(startDate)) base = base.gte("expense_date", startDate);
+    if (isValidDate(endDate)) base = base.lte("expense_date", endDate);
     if (category) base = base.eq("category", category);
     if (status) {
       if (status === "flagged") base = base.eq("flagged", true);
       if (status === "unflagged") base = base.eq("flagged", false);
     }
 
-    // Admin: all; Developer: own; Investor: now allowed read-only all expenses
     if (req.user.app_role === "developer") {
       base = base.eq("developer_id", req.user.id);
     }
@@ -446,7 +442,11 @@ app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
 // ---------- Reporting helper ----------
 async function getReports(filters = {}) {
   const { startDate, endDate, type } = filters;
-  const params = { startDate, endDate, type };
+  const params = {
+    startDate: isValidDate(startDate) ? startDate : null,
+    endDate: isValidDate(endDate) ? endDate : null,
+    type: type || null
+  };
   const { data: balances, error: balErr } = await supabaseService.rpc("report_balances_filtered", params);
   if (balErr) throw balErr;
   const { data: contribs, error: cErr } = await supabaseService.rpc("report_contributions_by_investor", params);
@@ -602,8 +602,7 @@ app.get("/api/receipts/:id/signed-url", requireAuth, attachRole, async (req, res
     if (req.user.app_role === "investor") {
       const { data: contrib } = await supabaseService.from("contributions").select("investor_id").eq("id", data.contribution_id).single();
       if (!contrib || contrib.investor_id !== req.user.id) {
-        // Since investors can see all contributions, allow read if you want. Otherwise enforce ownership:
-        // return res.status(403).json({ error: "Forbidden" });
+        // Optional: enforce ownership; currently investors can view all.
       }
     }
 
