@@ -46,7 +46,7 @@ app.use(morgan("dev"));
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } }); // 8MB
 
-const isValidDate = (v) => v && v !== "null" && v !== "undefined";
+const cleanDate = (v) => (v && v !== "null" && v !== "undefined" && v !== "" ? v : null);
 
 async function requireAuth(req, res, next) {
   try {
@@ -378,8 +378,10 @@ app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
       .eq("deleted_at", null)
       .order("created_at", { ascending: false });
 
-    if (isValidDate(startDate)) base = base.gte("date_sent", startDate);
-    if (isValidDate(endDate)) base = base.lte("date_sent", endDate);
+    const sDate = cleanDate(startDate);
+    const eDate = cleanDate(endDate);
+    if (sDate) base = base.gte("date_sent", sDate);
+    if (eDate) base = base.lte("date_sent", eDate);
     if (status) base = base.eq("status", status);
     if (investor_id) base = base.eq("investor_id", investor_id);
 
@@ -397,8 +399,11 @@ app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
   try {
     const { page, limit, startDate, endDate, status } = req.query;
     let base = supabaseService.from("receipts").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
-    if (isValidDate(startDate)) base = base.gte("created_at", startDate);
-    if (isValidDate(endDate)) base = base.lte("created_at", endDate);
+
+    const sDate = cleanDate(startDate);
+    const eDate = cleanDate(endDate);
+    if (sDate) base = base.gte("created_at", sDate);
+    if (eDate) base = base.lte("created_at", eDate);
     if (status) {
       if (status === "approved") base = base.eq("approved", true);
       if (status === "pending") base = base.eq("approved", false);
@@ -418,8 +423,11 @@ app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
   try {
     const { page, limit, startDate, endDate, status, category } = req.query;
     let base = supabaseService.from("expenses").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
-    if (isValidDate(startDate)) base = base.gte("expense_date", startDate);
-    if (isValidDate(endDate)) base = base.lte("expense_date", endDate);
+
+    const sDate = cleanDate(startDate);
+    const eDate = cleanDate(endDate);
+    if (sDate) base = base.gte("expense_date", sDate);
+    if (eDate) base = base.lte("expense_date", eDate);
     if (category) base = base.eq("category", category);
     if (status) {
       if (status === "flagged") base = base.eq("flagged", true);
@@ -429,6 +437,7 @@ app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
     if (req.user.app_role === "developer") {
       base = base.eq("developer_id", req.user.id);
     }
+
     const { query } = paginateQuery(base, page, limit);
     const { data, error, count } = await query;
     if (error) throw error;
@@ -443,8 +452,8 @@ app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
 async function getReports(filters = {}) {
   const { startDate, endDate, type } = filters;
   const params = {
-    startDate: isValidDate(startDate) ? startDate : null,
-    endDate: isValidDate(endDate) ? endDate : null,
+    startDate: cleanDate(startDate),
+    endDate: cleanDate(endDate),
     type: type || null
   };
   const { data: balances, error: balErr } = await supabaseService.rpc("report_balances_filtered", params);
@@ -602,7 +611,7 @@ app.get("/api/receipts/:id/signed-url", requireAuth, attachRole, async (req, res
     if (req.user.app_role === "investor") {
       const { data: contrib } = await supabaseService.from("contributions").select("investor_id").eq("id", data.contribution_id).single();
       if (!contrib || contrib.investor_id !== req.user.id) {
-        // Optional: enforce ownership; currently investors can view all.
+        // optional: enforce ownership
       }
     }
 
