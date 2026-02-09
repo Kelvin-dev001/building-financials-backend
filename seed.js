@@ -15,22 +15,19 @@ if (process.argv[2] !== SEED_SECRET) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-async function ensureUser(email, password, role) {
-  // Create auth user
+async function ensureUser(email, password, role, full_name = "") {
   const { data: authUser, error: authErr } = await supabase.auth.admin.createUser({
     email,
     password,
     email_confirm: true
   });
   if (authErr && authErr.message !== "User already registered") throw authErr;
-
   const userId = authUser?.user?.id;
 
-  // Upsert app_users + role-specific table
   const { error: upsertErr } = await supabase.from("app_users").upsert({
     id: userId,
     role,
-    full_name: role.toUpperCase()
+    full_name: full_name || role.toUpperCase()
   });
   if (upsertErr) throw upsertErr;
 
@@ -42,10 +39,18 @@ async function ensureUser(email, password, role) {
 }
 
 async function main() {
-  await ensureUser("admin@example.com", "Admin#12345", "admin");
-  await ensureUser("investor@example.com", "Investor#12345", "investor");
-  await ensureUser("developer@example.com", "Developer#12345", "developer");
-  console.log("Seed complete.");
+  // Admins
+  await ensureUser("mohamedrmohamed90@gmail.com", "Strong#Admin1!", "admin", "Mohamed Mohamed");
+  await ensureUser("kelshelenterprises101@gmail.com", "Strong#Admin1!", "admin", "Kelshel Enterprises");
+
+  // Developers
+  await ensureUser("khalylinvestment@gmail.com", "Strong#Dev1!", "developer", "Khalyl Investment");
+  await ensureUser("kelvinoyugi101@gmail.com", "Strong#Dev1!", "developer", "Kelvin Oyugi");
+
+  // Investors
+  await ensureUser("trapplord254@gmail.com", "Strong#Inv1!", "investor", "Trapplord");
+
+  console.log("Seed complete (production users).");
 }
 
 main().catch((e) => {
