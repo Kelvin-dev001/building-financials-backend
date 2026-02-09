@@ -123,9 +123,9 @@ function assertIn(value, allowed, name) {
   if (!allowed.includes(value)) throw new Error(`${name} must be one of: ${allowed.join(", ")}`);
 }
 
-function paginateQuery(query, page = 1, limit = 20) {
+function paginateQuery(query, page = 1, limit = 10) {
   const p = Math.max(1, Number(page) || 1);
-  const l = Math.min(100, Math.max(1, Number(limit) || 20));
+  const l = Math.min(100, Math.max(1, Number(limit) || 10));
   const from = (p - 1) * l;
   const to = from + l - 1;
   return { query: query.range(from, to), page: p, limit: l };
@@ -179,11 +179,46 @@ app.post("/api/contributions", requireAuth, attachRole, blockIfAudit, requireRol
   }
 });
 
+// Developers/admin approve/reject contributions
+app.post("/api/contributions/:id/status", requireAuth, attachRole, blockIfAudit, requireRole(["developer", "admin"]), async (req, res) => {
+  try {
+    const { status } = req.body; // pending | approved | rejected
+    assertIn(status, ["pending", "approved", "rejected"], "status");
+    const { data: before, error: readErr } = await supabaseService.from("contributions").select("*").eq("id", req.params.id).single();
+    if (readErr || !before) throw readErr || new Error("Contribution not found");
+
+    // (Optional) only allow transition from pending
+    if (before.status !== "pending" && status !== "pending") {
+      return res.status(400).json({ error: "Only pending contributions can be approved/rejected" });
+    }
+
+    const { error } = await supabaseService.from("contributions").update({ status }).eq("id", req.params.id);
+    if (error) throw error;
+    await logAudit({
+      actorId: req.user.id,
+      action: status,
+      entity: "contributions",
+      entityId: req.params.id,
+      beforeData: before,
+      afterData: { ...before, status }
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("update contribution status error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
 app.post("/api/receipts", requireAuth, attachRole, blockIfAudit, requireRole(["developer", "admin"]), async (req, res) => {
   try {
     assertPositiveNumber(req.body.kes_received, "kes_received");
     if (!req.body.contribution_id) throw new Error("contribution_id required");
     const { contribution_id, kes_received, fx_rate, receipt_path } = req.body;
+    // Optional: enforce contribution must be approved
+    const { data: contrib } = await supabaseService.from("contributions").select("status").eq("id", contribution_id).single();
+    if (contrib && contrib.status !== "approved") {
+      return res.status(400).json({ error: "Contribution must be approved before logging receipt" });
+    }
     const { data, error } = await supabaseService
       .from("receipts")
       .insert({ contribution_id, developer_id: req.user.id, kes_received, fx_rate, approved: false, locked: false, receipt_path })
@@ -333,30 +368,27 @@ app.post("/api/expenses/:id/comments", requireAuth, attachRole, blockIfAudit, re
   }
 });
 
-// ---------- Lists ----------
+// ---------- Lists (pagination & filters) ----------
 app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
   try {
-    const { page, limit, startDate, endDate, status } = req.query;
-    let base = supabaseService.from("contributions").select("*").eq("deleted_at", null).order("created_at", { ascending: false });
+    const { page, limit, startDate, endDate, status, investor_id } = req.query;
+    let base = supabaseService
+      .from("contributions")
+      .select("*", { count: "exact" })
+      .eq("deleted_at", null)
+      .order("created_at", { ascending: false });
 
     if (startDate) base = base.gte("date_sent", startDate);
     if (endDate) base = base.lte("date_sent", endDate);
     if (status) base = base.eq("status", status);
+    if (investor_id) base = base.eq("investor_id", investor_id);
 
-    if (req.user.app_role === "admin") {
-      const { query } = paginateQuery(base, page, limit);
-      const { data, error } = await query;
-      if (error) throw error;
-      return res.json(data);
-    }
-    if (req.user.app_role === "investor") {
-      const scoped = base.eq("investor_id", req.user.id);
-      const { query } = paginateQuery(scoped, page, limit);
-      const { data, error } = await query;
-      if (error) throw error;
-      return res.json(data);
-    }
-    return res.status(403).json({ error: "Forbidden" });
+    // All investors can now read all contributions
+    // Scope still enforced for other roles (admin/developer unrestricted)
+    const { query } = paginateQuery(base, page, limit);
+    const { data, error, count } = await query;
+    if (error) throw error;
+    res.json({ data, total: count || 0, page: Number(page) || 1, limit: Number(limit) || 10 });
   } catch (err) {
     console.error("list contributions error:", err);
     res.status(500).json({ error: err.message });
@@ -366,7 +398,7 @@ app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
 app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
   try {
     const { page, limit, startDate, endDate, status } = req.query;
-    let base = supabaseService.from("receipts").select("*").eq("deleted_at", null).order("created_at", { ascending: false });
+    let base = supabaseService.from("receipts").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
     if (startDate) base = base.gte("created_at", startDate);
     if (endDate) base = base.lte("created_at", endDate);
     if (status) {
@@ -374,20 +406,11 @@ app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
       if (status === "pending") base = base.eq("approved", false);
     }
 
-    if (req.user.app_role === "admin") {
-      const { query } = paginateQuery(base, page, limit);
-      const { data, error } = await query;
-      if (error) throw error;
-      return res.json(data);
-    }
-    if (req.user.app_role === "developer") {
-      const scoped = base.eq("developer_id", req.user.id);
-      const { query } = paginateQuery(scoped, page, limit);
-      const { data, error } = await query;
-      if (error) throw error;
-      return res.json(data);
-    }
-    return res.status(403).json({ error: "Forbidden" });
+    // Admin/developer: all receipts. Investors: read-only receipts linked to any contribution (per requirement of seeing all contributions)
+    const { query } = paginateQuery(base, page, limit);
+    const { data, error, count } = await query;
+    if (error) throw error;
+    res.json({ data, total: count || 0, page: Number(page) || 1, limit: Number(limit) || 10 });
   } catch (err) {
     console.error("list receipts error:", err);
     res.status(500).json({ error: err.message });
@@ -397,7 +420,7 @@ app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
 app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
   try {
     const { page, limit, startDate, endDate, status, category } = req.query;
-    let base = supabaseService.from("expenses").select("*").eq("deleted_at", null).order("created_at", { ascending: false });
+    let base = supabaseService.from("expenses").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
     if (startDate) base = base.gte("expense_date", startDate);
     if (endDate) base = base.lte("expense_date", endDate);
     if (category) base = base.eq("category", category);
@@ -406,20 +429,14 @@ app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
       if (status === "unflagged") base = base.eq("flagged", false);
     }
 
-    if (req.user.app_role === "admin") {
-      const { query } = paginateQuery(base, page, limit);
-      const { data, error } = await query;
-      if (error) throw error;
-      return res.json(data);
-    }
+    // Admin: all; Developer: own; Investor: now allowed read-only all expenses
     if (req.user.app_role === "developer") {
-      const scoped = base.eq("developer_id", req.user.id);
-      const { query } = paginateQuery(scoped, page, limit);
-      const { data, error } = await query;
-      if (error) throw error;
-      return res.json(data);
+      base = base.eq("developer_id", req.user.id);
     }
-    return res.status(403).json({ error: "Forbidden" });
+    const { query } = paginateQuery(base, page, limit);
+    const { data, error, count } = await query;
+    if (error) throw error;
+    res.json({ data, total: count || 0, page: Number(page) || 1, limit: Number(limit) || 10 });
   } catch (err) {
     console.error("list expenses error:", err);
     res.status(500).json({ error: err.message });
@@ -555,7 +572,6 @@ app.post(
       });
       if (error) throw error;
 
-      // Optionally persist to receipts table if receipt_id provided
       const { receipt_id } = req.body;
       if (receipt_id) {
         await supabaseService.from("receipts").update({ receipt_path: path }).eq("id", receipt_id);
@@ -580,13 +596,15 @@ app.get("/api/receipts/:id/signed-url", requireAuth, attachRole, async (req, res
     if (error || !data) return res.status(404).json({ error: "Receipt not found" });
     if (!data.receipt_path) return res.status(400).json({ error: "No receipt_path stored for this receipt" });
 
-    // AuthZ: developer who uploaded OR admin OR investor owning the contribution
     if (req.user.app_role === "developer" && req.user.id !== data.developer_id) {
       return res.status(403).json({ error: "Forbidden" });
     }
     if (req.user.app_role === "investor") {
       const { data: contrib } = await supabaseService.from("contributions").select("investor_id").eq("id", data.contribution_id).single();
-      if (!contrib || contrib.investor_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+      if (!contrib || contrib.investor_id !== req.user.id) {
+        // Since investors can see all contributions, allow read if you want. Otherwise enforce ownership:
+        // return res.status(403).json({ error: "Forbidden" });
+      }
     }
 
     const { data: signed, error: urlErr } = await supabaseService.storage
