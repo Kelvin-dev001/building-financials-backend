@@ -125,6 +125,18 @@ function assertIn(value, allowed, name) {
   if (!allowed.includes(value)) throw new Error(`${name} must be one of: ${allowed.join(", ")}`);
 }
 
+function cleanDateParam(v) {
+  if (!v) return null;
+  if (v === "null" || v === "undefined") return null;
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? null : v;
+}
+function cleanStringParam(v) {
+  if (!v) return null;
+  if (v === "null" || v === "undefined") return null;
+  return String(v).trim() || null;
+}
+
 function paginateQuery(query, page = 1, limit = 10) {
   const p = Math.max(1, Number(page) || 1);
   const l = Math.min(100, Math.max(1, Number(limit) || 10));
@@ -369,19 +381,24 @@ app.post("/api/expenses/:id/comments", requireAuth, attachRole, blockIfAudit, re
 });
 
 // ---------- Lists (pagination & filters) ----------
+// ---------- Lists (pagination & filters) ----------
 app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
   try {
-    const { page, limit, startDate, endDate, status, investor_id } = req.query;
+    const page = req.query.page;
+    const limit = req.query.limit;
+    const startDate = cleanDateParam(req.query.startDate);
+    const endDate = cleanDateParam(req.query.endDate);
+    const status = cleanStringParam(req.query.status);
+    const investor_id = cleanStringParam(req.query.investor_id);
+
     let base = supabaseService
       .from("contributions")
       .select("*", { count: "exact" })
       .eq("deleted_at", null)
       .order("created_at", { ascending: false });
 
-    const sDate = cleanDate(startDate);
-    const eDate = cleanDate(endDate);
-    if (sDate) base = base.gte("date_sent", sDate);
-    if (eDate) base = base.lte("date_sent", eDate);
+    if (startDate) base = base.gte("date_sent", startDate);
+    if (endDate) base = base.lte("date_sent", endDate);
     if (status) base = base.eq("status", status);
     if (investor_id) base = base.eq("investor_id", investor_id);
 
@@ -397,13 +414,15 @@ app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
 
 app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
   try {
-    const { page, limit, startDate, endDate, status } = req.query;
-    let base = supabaseService.from("receipts").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
+    const page = req.query.page;
+    const limit = req.query.limit;
+    const startDate = cleanDateParam(req.query.startDate);
+    const endDate = cleanDateParam(req.query.endDate);
+    const status = cleanStringParam(req.query.status);
 
-    const sDate = cleanDate(startDate);
-    const eDate = cleanDate(endDate);
-    if (sDate) base = base.gte("created_at", sDate);
-    if (eDate) base = base.lte("created_at", eDate);
+    let base = supabaseService.from("receipts").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
+    if (startDate) base = base.gte("created_at", startDate);
+    if (endDate) base = base.lte("created_at", endDate);
     if (status) {
       if (status === "approved") base = base.eq("approved", true);
       if (status === "pending") base = base.eq("approved", false);
@@ -421,13 +440,16 @@ app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
 
 app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
   try {
-    const { page, limit, startDate, endDate, status, category } = req.query;
-    let base = supabaseService.from("expenses").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
+    const page = req.query.page;
+    const limit = req.query.limit;
+    const startDate = cleanDateParam(req.query.startDate);
+    const endDate = cleanDateParam(req.query.endDate);
+    const status = cleanStringParam(req.query.status);
+    const category = cleanStringParam(req.query.category);
 
-    const sDate = cleanDate(startDate);
-    const eDate = cleanDate(endDate);
-    if (sDate) base = base.gte("expense_date", sDate);
-    if (eDate) base = base.lte("expense_date", eDate);
+    let base = supabaseService.from("expenses").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
+    if (startDate) base = base.gte("expense_date", startDate);
+    if (endDate) base = base.lte("expense_date", endDate);
     if (category) base = base.eq("category", category);
     if (status) {
       if (status === "flagged") base = base.eq("flagged", true);
@@ -437,7 +459,6 @@ app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
     if (req.user.app_role === "developer") {
       base = base.eq("developer_id", req.user.id);
     }
-
     const { query } = paginateQuery(base, page, limit);
     const { data, error, count } = await query;
     if (error) throw error;
@@ -471,8 +492,11 @@ async function getReports(filters = {}) {
 // ---------- Reporting endpoints ----------
 app.get("/api/reports/summary", requireAuth, attachRole, requireRole(["admin", "investor", "developer"]), async (req, res) => {
   try {
-    const { startDate, endDate, type } = req.query;
-    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate, type });
+    const startDate = cleanDateParam(req.query.startDate);
+    const endDate = cleanDateParam(req.query.endDate);
+    const type = cleanStringParam(req.query.type);
+    const params = { startDate, endDate, type };
+    const { balances, contribs, expensesByCat, monthlyCash } = await getReports(params);
     res.json({ balances, contributions_by_investor: contribs, expenses_by_category: expensesByCat, monthly_cashflow: monthlyCash });
   } catch (err) {
     console.error("report summary error:", err);
