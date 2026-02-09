@@ -17,7 +17,7 @@ const {
   SUPABASE_SERVICE_ROLE_KEY,
   SUPABASE_ANON_KEY,
   SUPABASE_STORAGE_BUCKET = "receipts",
-  PORT = 10000,
+  PORT = process.env.PORT || 10000,
   AUDIT_MODE = "false",
   CORS_ALLOW_ORIGINS = "*"
 } = process.env;
@@ -183,10 +183,10 @@ app.post("/api/receipts", requireAuth, attachRole, blockIfAudit, requireRole(["d
   try {
     assertPositiveNumber(req.body.kes_received, "kes_received");
     if (!req.body.contribution_id) throw new Error("contribution_id required");
-    const { contribution_id, kes_received, fx_rate } = req.body;
+    const { contribution_id, kes_received, fx_rate, receipt_path } = req.body;
     const { data, error } = await supabaseService
       .from("receipts")
-      .insert({ contribution_id, developer_id: req.user.id, kes_received, fx_rate, approved: false, locked: false })
+      .insert({ contribution_id, developer_id: req.user.id, kes_received, fx_rate, approved: false, locked: false, receipt_path })
       .select()
       .single();
     if (error) throw error;
@@ -333,7 +333,7 @@ app.post("/api/expenses/:id/comments", requireAuth, attachRole, blockIfAudit, re
   }
 });
 
-// ---------- Lists (filter deleted_at) with pagination & filters ----------
+// ---------- Lists ----------
 app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
   try {
     const { page, limit, startDate, endDate, status } = req.query;
@@ -533,22 +533,6 @@ app.get("/api/export/pdf", requireAuth, attachRole, requireRole(["admin"]), asyn
   }
 });
 
-// ---------- Admin: audit logs ----------
-app.get("/api/admin/audit-logs", requireAuth, attachRole, requireRole(["admin"]), async (_req, res) => {
-  try {
-    const { data, error } = await supabaseService
-      .from("audit_logs")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(200);
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    console.error("list audit error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ---------- Receipt upload (PDF/image) & signed URL ----------
 app.post(
   "/api/uploads/receipt",
@@ -570,7 +554,13 @@ app.post(
         upsert: false
       });
       if (error) throw error;
-      // Do NOT make public; use signed URL
+
+      // Optionally persist to receipts table if receipt_id provided
+      const { receipt_id } = req.body;
+      if (receipt_id) {
+        await supabaseService.from("receipts").update({ receipt_path: path }).eq("id", receipt_id);
+      }
+
       res.json({ ok: true, path });
     } catch (err) {
       console.error("upload error:", err);
@@ -582,15 +572,19 @@ app.post(
 // Signed URL endpoint (15m default)
 app.get("/api/receipts/:id/signed-url", requireAuth, attachRole, async (req, res) => {
   try {
-    const { data, error } = await supabaseService.from("receipts").select("id, receipt_path, developer_id, contribution_id").eq("id", req.params.id).single();
+    const { data, error } = await supabaseService
+      .from("receipts")
+      .select("id, receipt_path, developer_id, contribution_id")
+      .eq("id", req.params.id)
+      .single();
     if (error || !data) return res.status(404).json({ error: "Receipt not found" });
+    if (!data.receipt_path) return res.status(400).json({ error: "No receipt_path stored for this receipt" });
 
     // AuthZ: developer who uploaded OR admin OR investor owning the contribution
     if (req.user.app_role === "developer" && req.user.id !== data.developer_id) {
       return res.status(403).json({ error: "Forbidden" });
     }
     if (req.user.app_role === "investor") {
-      // ensure contribution belongs to investor
       const { data: contrib } = await supabaseService.from("contributions").select("investor_id").eq("id", data.contribution_id).single();
       if (!contrib || contrib.investor_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
     }
