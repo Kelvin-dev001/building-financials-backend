@@ -46,7 +46,18 @@ app.use(morgan("dev"));
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } }); // 8MB
 
+// Helpers to sanitize incoming params and avoid "null"/"undefined" strings that break timestamp parsing
 const cleanDate = (v) => (v && v !== "null" && v !== "undefined" && v !== "" ? v : null);
+function cleanDateParam(v) {
+  if (!v || v === "null" || v === "undefined" || v === "") return null;
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? null : v;
+}
+function cleanStringParam(v) {
+  if (!v || v === "null" || v === "undefined") return null;
+  const s = String(v).trim();
+  return s.length ? s : null;
+}
 
 async function requireAuth(req, res, next) {
   try {
@@ -125,18 +136,6 @@ function assertIn(value, allowed, name) {
   if (!allowed.includes(value)) throw new Error(`${name} must be one of: ${allowed.join(", ")}`);
 }
 
-function cleanDateParam(v) {
-  if (!v) return null;
-  if (v === "null" || v === "undefined") return null;
-  const t = Date.parse(v);
-  return Number.isNaN(t) ? null : v;
-}
-function cleanStringParam(v) {
-  if (!v) return null;
-  if (v === "null" || v === "undefined") return null;
-  return String(v).trim() || null;
-}
-
 function paginateQuery(query, page = 1, limit = 10) {
   const p = Math.max(1, Number(page) || 1);
   const l = Math.min(100, Math.max(1, Number(limit) || 10));
@@ -193,7 +192,6 @@ app.post("/api/contributions", requireAuth, attachRole, blockIfAudit, requireRol
   }
 });
 
-// Developers/admin approve/reject contributions
 app.post("/api/contributions/:id/status", requireAuth, attachRole, blockIfAudit, requireRole(["developer", "admin"]), async (req, res) => {
   try {
     const { status } = req.body; // pending | approved | rejected
@@ -380,7 +378,6 @@ app.post("/api/expenses/:id/comments", requireAuth, attachRole, blockIfAudit, re
   }
 });
 
-// ---------- Lists (pagination & filters) ----------
 // ---------- Lists (pagination & filters) ----------
 app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
   try {
