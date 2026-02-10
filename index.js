@@ -47,16 +47,18 @@ app.use(morgan("dev"));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } }); // 8MB
 
 // Helpers to sanitize incoming params and avoid "null"/"undefined" strings that break timestamp parsing
-const cleanDate = (v) => (v && v !== "null" && v !== "undefined" && v !== "" ? v : null);
-function cleanDateParam(v) {
-  if (!v || v === "null" || v === "undefined" || v === "") return null;
-  const t = Date.parse(v);
-  return Number.isNaN(t) ? null : v;
+function cleanStringParam(value) {
+  if (value === undefined || value === null) return null;
+  const s = String(value).trim();
+  if (!s || s === "null" || s === "undefined") return null;
+  return s;
 }
-function cleanStringParam(v) {
-  if (!v || v === "null" || v === "undefined") return null;
-  const s = String(v).trim();
-  return s.length ? s : null;
+
+function cleanDateParam(value) {
+  const s = cleanStringParam(value);
+  if (!s) return null;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? null : s;
 }
 
 async function requireAuth(req, res, next) {
@@ -391,7 +393,7 @@ app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
     let base = supabaseService
       .from("contributions")
       .select("*", { count: "exact" })
-      .eq("deleted_at", null)
+      .is("deleted_at", null)
       .order("created_at", { ascending: false });
 
     if (startDate) base = base.gte("date_sent", startDate);
@@ -399,10 +401,10 @@ app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
     if (status) base = base.eq("status", status);
     if (investor_id) base = base.eq("investor_id", investor_id);
 
-    const { query } = paginateQuery(base, page, limit);
+    const { query, page: pageNum, limit: limitNum } = paginateQuery(base, page, limit);
     const { data, error, count } = await query;
     if (error) throw error;
-    res.json({ data, total: count || 0, page: Number(page) || 1, limit: Number(limit) || 10 });
+    res.json({ data, total: count || 0, page: pageNum, limit: limitNum });
   } catch (err) {
     console.error("list contributions error:", err);
     res.status(500).json({ error: err.message });
@@ -417,7 +419,7 @@ app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
     const endDate = cleanDateParam(req.query.endDate);
     const status = cleanStringParam(req.query.status);
 
-    let base = supabaseService.from("receipts").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
+    let base = supabaseService.from("receipts").select("*", { count: "exact" }).is("deleted_at", null).order("created_at", { ascending: false });
     if (startDate) base = base.gte("created_at", startDate);
     if (endDate) base = base.lte("created_at", endDate);
     if (status) {
@@ -425,10 +427,10 @@ app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
       if (status === "pending") base = base.eq("approved", false);
     }
 
-    const { query } = paginateQuery(base, page, limit);
+    const { query, page: pageNum, limit: limitNum } = paginateQuery(base, page, limit);
     const { data, error, count } = await query;
     if (error) throw error;
-    res.json({ data, total: count || 0, page: Number(page) || 1, limit: Number(limit) || 10 });
+    res.json({ data, total: count || 0, page: pageNum, limit: limitNum });
   } catch (err) {
     console.error("list receipts error:", err);
     res.status(500).json({ error: err.message });
@@ -444,7 +446,7 @@ app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
     const status = cleanStringParam(req.query.status);
     const category = cleanStringParam(req.query.category);
 
-    let base = supabaseService.from("expenses").select("*", { count: "exact" }).eq("deleted_at", null).order("created_at", { ascending: false });
+    let base = supabaseService.from("expenses").select("*", { count: "exact" }).is("deleted_at", null).order("created_at", { ascending: false });
     if (startDate) base = base.gte("expense_date", startDate);
     if (endDate) base = base.lte("expense_date", endDate);
     if (category) base = base.eq("category", category);
@@ -456,10 +458,10 @@ app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
     if (req.user.app_role === "developer") {
       base = base.eq("developer_id", req.user.id);
     }
-    const { query } = paginateQuery(base, page, limit);
+    const { query, page: pageNum, limit: limitNum } = paginateQuery(base, page, limit);
     const { data, error, count } = await query;
     if (error) throw error;
-    res.json({ data, total: count || 0, page: Number(page) || 1, limit: Number(limit) || 10 });
+    res.json({ data, total: count || 0, page: pageNum, limit: limitNum });
   } catch (err) {
     console.error("list expenses error:", err);
     res.status(500).json({ error: err.message });
@@ -468,19 +470,27 @@ app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
 
 // ---------- Reporting helper ----------
 async function getReports(filters = {}) {
-  const { startDate, endDate, type } = filters;
-  const params = {
-    startDate: cleanDate(startDate),
-    endDate: cleanDate(endDate),
-    type: type || null
+  const startDate = cleanDateParam(filters.startDate);
+  const endDate = cleanDateParam(filters.endDate);
+  const type = cleanStringParam(filters.type);
+
+  // Match SQL function signature exactly (lowercase parameter names)
+  const rpcParams = {
+    startdate: startDate,
+    enddate: endDate,
+    type: type
   };
-  const { data: balances, error: balErr } = await supabaseService.rpc("report_balances_filtered", params);
+
+  const { data: balances, error: balErr } = await supabaseService.rpc("report_balances_filtered", rpcParams);
   if (balErr) throw balErr;
-  const { data: contribs, error: cErr } = await supabaseService.rpc("report_contributions_by_investor", params);
+
+  const { data: contribs, error: cErr } = await supabaseService.rpc("report_contributions_by_investor", rpcParams);
   if (cErr) throw cErr;
-  const { data: expensesByCat, error: eErr } = await supabaseService.rpc("report_expenses_by_category", params);
+
+  const { data: expensesByCat, error: eErr } = await supabaseService.rpc("report_expenses_by_category", rpcParams);
   if (eErr) throw eErr;
-  const { data: monthlyCash, error: mErr } = await supabaseService.rpc("report_monthly_cashflow", params);
+
+  const { data: monthlyCash, error: mErr } = await supabaseService.rpc("report_monthly_cashflow", rpcParams);
   if (mErr) throw mErr;
 
   return { balances, contribs, expensesByCat, monthlyCash };
@@ -492,8 +502,7 @@ app.get("/api/reports/summary", requireAuth, attachRole, requireRole(["admin", "
     const startDate = cleanDateParam(req.query.startDate);
     const endDate = cleanDateParam(req.query.endDate);
     const type = cleanStringParam(req.query.type);
-    const params = { startDate, endDate, type };
-    const { balances, contribs, expensesByCat, monthlyCash } = await getReports(params);
+    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate, type });
     res.json({ balances, contributions_by_investor: contribs, expenses_by_category: expensesByCat, monthly_cashflow: monthlyCash });
   } catch (err) {
     console.error("report summary error:", err);
@@ -504,7 +513,9 @@ app.get("/api/reports/summary", requireAuth, attachRole, requireRole(["admin", "
 // ---------- Exports ----------
 app.get("/api/export/excel", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
   try {
-    const { startDate, endDate, type } = req.query;
+    const startDate = cleanDateParam(req.query.startDate);
+    const endDate = cleanDateParam(req.query.endDate);
+    const type = cleanStringParam(req.query.type);
     const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate, type });
     const wb = new ExcelJS.Workbook();
     wb.creator = "BrickLedger";
@@ -540,7 +551,9 @@ app.get("/api/export/excel", requireAuth, attachRole, requireRole(["admin"]), as
 
 app.get("/api/export/pdf", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
   try {
-    const { startDate, endDate, type } = req.query;
+    const startDate = cleanDateParam(req.query.startDate);
+    const endDate = cleanDateParam(req.query.endDate);
+    const type = cleanStringParam(req.query.type);
     const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate, type });
     const doc = new PDFDocument();
     const bufferStream = new streamBuffers.WritableStreamBuffer();
