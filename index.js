@@ -146,6 +146,15 @@ function paginateQuery(query, page = 1, limit = 10) {
   return { query: query.range(from, to), page: p, limit: l };
 }
 
+function assertEditableEntry(entry, role) {
+  if (role === "admin") return;
+  if (entry.locked) throw new Error("Entry locked. Admin unlock required.");
+  const createdAt = new Date(entry.created_at).getTime();
+  if (Date.now() - createdAt > 24 * 60 * 60 * 1000) {
+    throw new Error("Entry locked after 24 hours. Admin unlock required.");
+  }
+}
+
 // ---------- Health ----------
 app.get("/health", async (_req, res) => {
   try {
@@ -265,330 +274,461 @@ app.post("/api/expenses", requireAuth, attachRole, blockIfAudit, requireRole(["d
   }
 });
 
-app.post("/api/admin/receipts/:id/approve", requireAuth, attachRole, blockIfAudit, requireRole(["admin"]), async (req, res) => {
+// ---------- Developer Materials & Labour ----------
+app.get("/api/material-entries", requireAuth, attachRole, requireRole(["developer", "admin"]), async (req, res) => {
   try {
-    const { data: before } = await supabaseService.from("receipts").select("*").eq("id", req.params.id).single();
-    const { error } = await supabaseService.from("receipts").update({ approved: true, confirmed_at: new Date().toISOString() }).eq("id", req.params.id);
-    if (error) throw error;
-    await logAudit({
-      actorId: req.user.id,
-      action: "approve",
-      entity: "receipts",
-      entityId: req.params.id,
-      beforeData: before,
-      afterData: { ...before, approved: true }
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("approve receipt error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// ---------- Locks (admin) ----------
-app.post("/api/admin/:table/:id/lock", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
-  const { table, id } = req.params;
-  if (!["contributions", "receipts", "expenses"].includes(table)) return res.status(400).json({ error: "Invalid table" });
-  try {
-    const { data: before } = await supabaseService.from(table).select("*").eq("id", id).single();
-    const { error } = await supabaseService.from(table).update({ locked: true }).eq("id", id);
-    if (error) throw error;
-    await logAudit({
-      actorId: req.user.id,
-      action: "lock",
-      entity: table,
-      entityId: id,
-      beforeData: before,
-      afterData: { ...before, locked: true }
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("lock error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// ---------- Soft delete (admin) ----------
-app.post("/api/admin/:table/:id/soft-delete", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
-  const { table, id } = req.params;
-  if (!["contributions", "receipts", "expenses", "expense_comments"].includes(table)) {
-    return res.status(400).json({ error: "Invalid table" });
-  }
-  try {
-    const { data: before } = await supabaseService.from(table).select("*").eq("id", id).single();
-    const ts = new Date().toISOString();
-    const { error } = await supabaseService.from(table).update({ deleted_at: ts }).eq("id", id);
-    if (error) throw error;
-    await logAudit({
-      actorId: req.user.id,
-      action: "soft_delete",
-      entity: table,
-      entityId: id,
-      beforeData: before,
-      afterData: { ...before, deleted_at: ts }
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("soft delete error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// ---------- Flags & Comments ----------
-app.post("/api/expenses/:id/flag", requireAuth, attachRole, blockIfAudit, requireRole(["investor", "admin"]), async (req, res) => {
-  const { flagged = true } = req.body;
-  try {
-    const { data: before } = await supabaseService.from("expenses").select("*").eq("id", req.params.id).single();
-    const { error } = await supabaseService.from("expenses").update({ flagged }).eq("id", req.params.id);
-    if (error) throw error;
-    await logAudit({
-      actorId: req.user.id,
-      action: flagged ? "flag" : "unflag",
-      entity: "expenses",
-      entityId: req.params.id,
-      beforeData: before,
-      afterData: { ...before, flagged }
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("flag expense error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post("/api/expenses/:id/comments", requireAuth, attachRole, blockIfAudit, requireRole(["investor", "admin", "developer"]), async (req, res) => {
-  const { comment } = req.body;
-  if (!comment) return res.status(400).json({ error: "comment required" });
-  try {
-    const { data, error } = await supabaseService
-      .from("expense_comments")
-      .insert({ expense_id: req.params.id, commenter_id: req.user.id, comment })
-      .select()
-      .single();
-    if (error) throw error;
-    await logAudit({
-      actorId: req.user.id,
-      action: "comment",
-      entity: "expense_comments",
-      entityId: data.id,
-      afterData: data
-    });
-    res.json({ ok: true, id: data.id });
-  } catch (err) {
-    console.error("comment error:", err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// ---------- Lists (pagination & filters) ----------
-app.get("/api/contributions", requireAuth, attachRole, async (req, res) => {
-  try {
-    const page = req.query.page;
-    const limit = req.query.limit;
     const startDate = cleanDateParam(req.query.startDate);
     const endDate = cleanDateParam(req.query.endDate);
-    const status = cleanStringParam(req.query.status);
-    const investor_id = cleanStringParam(req.query.investor_id);
 
     let base = supabaseService
-      .from("contributions")
-      .select("*", { count: "exact" })
+      .from("material_entries")
+      .select("*, material_items(*)", { count: "exact" })
       .is("deleted_at", null)
-      .order("created_at", { ascending: false });
+      .order("entry_date", { ascending: false });
 
-    if (startDate) base = base.gte("date_sent", startDate);
-    if (endDate) base = base.lte("date_sent", endDate);
-    if (status) base = base.eq("status", status);
-    if (investor_id) base = base.eq("investor_id", investor_id);
-
-    const { query, page: pageNum, limit: limitNum } = paginateQuery(base, page, limit);
-    const { data, error, count } = await query;
-    if (error) throw error;
-    res.json({ data, total: count || 0, page: pageNum, limit: limitNum });
-  } catch (err) {
-    console.error("list contributions error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/receipts", requireAuth, attachRole, async (req, res) => {
-  try {
-    const page = req.query.page;
-    const limit = req.query.limit;
-    const startDate = cleanDateParam(req.query.startDate);
-    const endDate = cleanDateParam(req.query.endDate);
-    const status = cleanStringParam(req.query.status);
-
-    let base = supabaseService.from("receipts").select("*", { count: "exact" }).is("deleted_at", null).order("created_at", { ascending: false });
-    if (startDate) base = base.gte("created_at", startDate);
-    if (endDate) base = base.lte("created_at", endDate);
-    if (status) {
-      if (status === "approved") base = base.eq("approved", true);
-      if (status === "pending") base = base.eq("approved", false);
-    }
-
-    const { query, page: pageNum, limit: limitNum } = paginateQuery(base, page, limit);
-    const { data, error, count } = await query;
-    if (error) throw error;
-    res.json({ data, total: count || 0, page: pageNum, limit: limitNum });
-  } catch (err) {
-    console.error("list receipts error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/expenses", requireAuth, attachRole, async (req, res) => {
-  try {
-    const page = req.query.page;
-    const limit = req.query.limit;
-    const startDate = cleanDateParam(req.query.startDate);
-    const endDate = cleanDateParam(req.query.endDate);
-    const status = cleanStringParam(req.query.status);
-    const category = cleanStringParam(req.query.category);
-
-    let base = supabaseService.from("expenses").select("*", { count: "exact" }).is("deleted_at", null).order("created_at", { ascending: false });
-    if (startDate) base = base.gte("expense_date", startDate);
-    if (endDate) base = base.lte("expense_date", endDate);
-    if (category) base = base.eq("category", category);
-    if (status) {
-      if (status === "flagged") base = base.eq("flagged", true);
-      if (status === "unflagged") base = base.eq("flagged", false);
-    }
+    if (startDate) base = base.gte("entry_date", startDate);
+    if (endDate) base = base.lte("entry_date", endDate);
 
     if (req.user.app_role === "developer") {
       base = base.eq("developer_id", req.user.id);
     }
-    const { query, page: pageNum, limit: limitNum } = paginateQuery(base, page, limit);
-    const { data, error, count } = await query;
+
+    const { data, error } = await base;
     if (error) throw error;
-    res.json({ data, total: count || 0, page: pageNum, limit: limitNum });
+    res.json({ data });
   } catch (err) {
-    console.error("list expenses error:", err);
+    console.error("list material entries error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---------- Reporting helper ----------
-async function getReports(filters = {}) {
-  const startDate = cleanDateParam(filters.startDate);
-  const endDate = cleanDateParam(filters.endDate);
-  const type = cleanStringParam(filters.type);
-
-  // Match SQL function signature exactly (lowercase parameter names)
-  const rpcParams = {
-    startdate: startDate,
-    enddate: endDate,
-    type: type
-  };
-
-  const { data: balances, error: balErr } = await supabaseService.rpc("report_balances_filtered", rpcParams);
-  if (balErr) throw balErr;
-
-  const { data: contribs, error: cErr } = await supabaseService.rpc("report_contributions_by_investor", rpcParams);
-  if (cErr) throw cErr;
-
-  const { data: expensesByCat, error: eErr } = await supabaseService.rpc("report_expenses_by_category", rpcParams);
-  if (eErr) throw eErr;
-
-  const { data: monthlyCash, error: mErr } = await supabaseService.rpc("report_monthly_cashflow", rpcParams);
-  if (mErr) throw mErr;
-
-  return { balances, contribs, expensesByCat, monthlyCash };
-}
-
-// ---------- Reporting endpoints ----------
-app.get("/api/reports/summary", requireAuth, attachRole, requireRole(["admin", "investor", "developer"]), async (req, res) => {
+app.get("/api/labour-entries", requireAuth, attachRole, requireRole(["developer", "admin"]), async (req, res) => {
   try {
     const startDate = cleanDateParam(req.query.startDate);
     const endDate = cleanDateParam(req.query.endDate);
-    const type = cleanStringParam(req.query.type);
-    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate, type });
-    res.json({ balances, contributions_by_investor: contribs, expenses_by_category: expensesByCat, monthly_cashflow: monthlyCash });
+
+    let base = supabaseService
+      .from("labour_entries")
+      .select("*, labour_items(*)", { count: "exact" })
+      .is("deleted_at", null)
+      .order("entry_date", { ascending: false });
+
+    if (startDate) base = base.gte("entry_date", startDate);
+    if (endDate) base = base.lte("entry_date", endDate);
+
+    if (req.user.app_role === "developer") {
+      base = base.eq("developer_id", req.user.id);
+    }
+
+    const { data, error } = await base;
+    if (error) throw error;
+    res.json({ data });
   } catch (err) {
-    console.error("report summary error:", err);
+    console.error("list labour entries error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---------- Exports ----------
-app.get("/api/export/excel", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
+app.post("/api/material-entries", requireAuth, attachRole, blockIfAudit, requireRole(["developer", "admin"]), async (req, res) => {
   try {
-    const startDate = cleanDateParam(req.query.startDate);
-    const endDate = cleanDateParam(req.query.endDate);
-    const type = cleanStringParam(req.query.type);
-    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate, type });
+    const entry_date = cleanDateParam(req.body.entry_date);
+    const items = Array.isArray(req.body.items) ? req.body.items : [];
+    if (!entry_date) throw new Error("entry_date required");
+    if (!items.length) throw new Error("At least one item is required");
+
+    let entry = null;
+
+    const { data: existing } = await supabaseService
+      .from("material_entries")
+      .select("*")
+      .eq("developer_id", req.user.id)
+      .eq("entry_date", entry_date)
+      .is("deleted_at", null)
+      .maybeSingle();
+
+    if (existing) {
+      assertEditableEntry(existing, req.user.app_role);
+      entry = existing;
+    } else {
+      const { data: created, error: createErr } = await supabaseService
+        .from("material_entries")
+        .insert({ developer_id: req.user.id, entry_date })
+        .select()
+        .single();
+      if (createErr) throw createErr;
+      entry = created;
+      await logAudit({ actorId: req.user.id, action: "create", entity: "material_entries", entityId: entry.id, afterData: entry });
+    }
+
+    const itemPayload = items.map((item) => {
+      assertPositiveNumber(item.quantity, "quantity");
+      assertPositiveNumber(item.unit_cost, "unit_cost");
+      if (!item.description) throw new Error("description required");
+      return {
+        entry_id: entry.id,
+        description: item.description,
+        supplier: item.supplier || null,
+        quantity: Number(item.quantity),
+        unit_cost: Number(item.unit_cost)
+      };
+    });
+
+    const { data: createdItems, error: itemsErr } = await supabaseService
+      .from("material_items")
+      .insert(itemPayload)
+      .select();
+    if (itemsErr) throw itemsErr;
+
+    const expensePayload = createdItems.map((item) => ({
+      developer_id: req.user.id,
+      amount_kes: Number(item.quantity) * Number(item.unit_cost),
+      category: "materials",
+      expense_date: entry.entry_date,
+      description: `Material: ${item.description} | Item ${item.id}`,
+      receipt_url: entry.receipt_path || null,
+      locked: false
+    }));
+
+    const { error: expErr } = await supabaseService.from("expenses").insert(expensePayload);
+    if (expErr) throw expErr;
+
+    await logAudit({
+      actorId: req.user.id,
+      action: "create_items",
+      entity: "material_items",
+      entityId: entry.id,
+      afterData: createdItems
+    });
+
+    res.json({ ok: true, entry, items: createdItems });
+  } catch (err) {
+    console.error("create material entry error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post("/api/labour-entries", requireAuth, attachRole, blockIfAudit, requireRole(["developer", "admin"]), async (req, res) => {
+  try {
+    const entry_date = cleanDateParam(req.body.entry_date);
+    const items = Array.isArray(req.body.items) ? req.body.items : [];
+    if (!entry_date) throw new Error("entry_date required");
+    if (!items.length) throw new Error("At least one item is required");
+
+    let entry = null;
+
+    const { data: existing } = await supabaseService
+      .from("labour_entries")
+      .select("*")
+      .eq("developer_id", req.user.id)
+      .eq("entry_date", entry_date)
+      .is("deleted_at", null)
+      .maybeSingle();
+
+    if (existing) {
+      assertEditableEntry(existing, req.user.app_role);
+      entry = existing;
+    } else {
+      const { data: created, error: createErr } = await supabaseService
+        .from("labour_entries")
+        .insert({ developer_id: req.user.id, entry_date })
+        .select()
+        .single();
+      if (createErr) throw createErr;
+      entry = created;
+      await logAudit({ actorId: req.user.id, action: "create", entity: "labour_entries", entityId: entry.id, afterData: entry });
+    }
+
+    const itemPayload = items.map((item) => {
+      assertPositiveNumber(item.rate_per_day, "rate_per_day");
+      const days = Number(item.days_worked || 1);
+      if (days <= 0) throw new Error("days_worked must be > 0");
+      if (!item.labourer_name) throw new Error("labourer_name required");
+      return {
+        entry_id: entry.id,
+        labourer_name: item.labourer_name,
+        role: item.role || null,
+        rate_per_day: Number(item.rate_per_day),
+        total_paid: Number(item.rate_per_day) * days
+      };
+    });
+
+    const { data: createdItems, error: itemsErr } = await supabaseService
+      .from("labour_items")
+      .insert(itemPayload)
+      .select();
+    if (itemsErr) throw itemsErr;
+
+    const expensePayload = createdItems.map((item) => ({
+      developer_id: req.user.id,
+      amount_kes: Number(item.total_paid),
+      category: "labour",
+      expense_date: entry.entry_date,
+      description: `Labour: ${item.labourer_name}${item.role ? ` (${item.role})` : ""} | Item ${item.id}`,
+      locked: false
+    }));
+
+    const { error: expErr } = await supabaseService.from("expenses").insert(expensePayload);
+    if (expErr) throw expErr;
+
+    await logAudit({
+      actorId: req.user.id,
+      action: "create_items",
+      entity: "labour_items",
+      entityId: entry.id,
+      afterData: createdItems
+    });
+
+    res.json({ ok: true, entry, items: createdItems });
+  } catch (err) {
+    console.error("create labour entry error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.patch("/api/material-items/:id", requireAuth, attachRole, blockIfAudit, requireRole(["developer", "admin"]), async (req, res) => {
+  try {
+    const { data: item, error } = await supabaseService
+      .from("material_items")
+      .select("*, material_entries(*)")
+      .eq("id", req.params.id)
+      .single();
+    if (error || !item) throw error || new Error("Item not found");
+
+    if (req.user.app_role === "developer" && item.material_entries.developer_id !== req.user.id) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    assertEditableEntry(item.material_entries, req.user.app_role);
+
+    const updates = {};
+    if (req.body.description) updates.description = req.body.description;
+    if (req.body.supplier !== undefined) updates.supplier = req.body.supplier || null;
+    if (req.body.quantity !== undefined) {
+      assertPositiveNumber(req.body.quantity, "quantity");
+      updates.quantity = Number(req.body.quantity);
+    }
+    if (req.body.unit_cost !== undefined) {
+      assertPositiveNumber(req.body.unit_cost, "unit_cost");
+      updates.unit_cost = Number(req.body.unit_cost);
+    }
+
+    const { data: updated, error: updateErr } = await supabaseService
+      .from("material_items")
+      .update(updates)
+      .eq("id", req.params.id)
+      .select()
+      .single();
+    if (updateErr) throw updateErr;
+
+    await supabaseService
+      .from("expenses")
+      .update({
+        amount_kes: Number(updated.quantity) * Number(updated.unit_cost),
+        description: `Material: ${updated.description} | Item ${updated.id}`
+      })
+      .eq("developer_id", item.material_entries.developer_id)
+      .eq("category", "materials")
+      .eq("expense_date", item.material_entries.entry_date)
+      .ilike("description", `%Item ${updated.id}%`);
+
+    await logAudit({
+      actorId: req.user.id,
+      action: "update",
+      entity: "material_items",
+      entityId: updated.id,
+      beforeData: item,
+      afterData: updated
+    });
+
+    res.json({ ok: true, item: updated });
+  } catch (err) {
+    console.error("update material item error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.patch("/api/labour-items/:id", requireAuth, attachRole, blockIfAudit, requireRole(["developer", "admin"]), async (req, res) => {
+  try {
+    const { data: item, error } = await supabaseService
+      .from("labour_items")
+      .select("*, labour_entries(*)")
+      .eq("id", req.params.id)
+      .single();
+    if (error || !item) throw error || new Error("Item not found");
+
+    if (req.user.app_role === "developer" && item.labour_entries.developer_id !== req.user.id) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    assertEditableEntry(item.labour_entries, req.user.app_role);
+
+    const updates = {};
+    if (req.body.labourer_name) updates.labourer_name = req.body.labourer_name;
+    if (req.body.role !== undefined) updates.role = req.body.role || null;
+    if (req.body.rate_per_day !== undefined) {
+      assertPositiveNumber(req.body.rate_per_day, "rate_per_day");
+      updates.rate_per_day = Number(req.body.rate_per_day);
+    }
+    const days = Number(req.body.days_worked || 1);
+    if (days <= 0) throw new Error("days_worked must be > 0");
+    updates.total_paid = Number(updates.rate_per_day || item.rate_per_day) * days;
+
+    const { data: updated, error: updateErr } = await supabaseService
+      .from("labour_items")
+      .update(updates)
+      .eq("id", req.params.id)
+      .select()
+      .single();
+    if (updateErr) throw updateErr;
+
+    await supabaseService
+      .from("expenses")
+      .update({
+        amount_kes: Number(updated.total_paid),
+        description: `Labour: ${updated.labourer_name}${updated.role ? ` (${updated.role})` : ""} | Item ${updated.id}`
+      })
+      .eq("developer_id", item.labour_entries.developer_id)
+      .eq("category", "labour")
+      .eq("expense_date", item.labour_entries.entry_date)
+      .ilike("description", `%Item ${updated.id}%`);
+
+    await logAudit({
+      actorId: req.user.id,
+      action: "update",
+      entity: "labour_items",
+      entityId: updated.id,
+      beforeData: item,
+      afterData: updated
+    });
+
+    res.json({ ok: true, item: updated });
+  } catch (err) {
+    console.error("update labour item error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Material receipt upload (materials only)
+app.post(
+  "/api/material-entries/:id/receipt",
+  requireAuth,
+  attachRole,
+  blockIfAudit,
+  requireRole(["developer", "admin"]),
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) throw new Error("File is required");
+      const ext = req.file.originalname.split(".").pop().toLowerCase();
+      if (!["pdf", "png", "jpg", "jpeg", "webp"].includes(ext)) {
+        throw new Error("Unsupported file type");
+      }
+
+      const { data: entry, error: entryErr } = await supabaseService
+        .from("material_entries")
+        .select("*")
+        .eq("id", req.params.id)
+        .single();
+      if (entryErr || !entry) throw entryErr || new Error("Entry not found");
+      if (req.user.app_role === "developer" && entry.developer_id !== req.user.id) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      assertEditableEntry(entry, req.user.app_role);
+
+      const path = `materials/${req.user.id}/${Date.now()}-${req.file.originalname}`;
+      const { error } = await supabaseService.storage.from(SUPABASE_STORAGE_BUCKET).upload(path, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: false
+      });
+      if (error) throw error;
+
+      await supabaseService.from("material_entries").update({ receipt_path: path }).eq("id", entry.id);
+
+      res.json({ ok: true, path });
+    } catch (err) {
+      console.error("material receipt upload error:", err);
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+// Admin unlock for entries
+app.post("/api/admin/:table/:id/unlock", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
+  const { table, id } = req.params;
+  if (!["material_entries", "labour_entries", "expenses", "receipts", "contributions"].includes(table)) {
+    return res.status(400).json({ error: "Invalid table" });
+  }
+  try {
+    const { data: before } = await supabaseService.from(table).select("*").eq("id", id).single();
+    const { error } = await supabaseService.from(table).update({ locked: false }).eq("id", id);
+    if (error) throw error;
+    await logAudit({
+      actorId: req.user.id,
+      action: "unlock",
+      entity: table,
+      entityId: id,
+      beforeData: before,
+      afterData: { ...before, locked: false }
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("unlock error:", err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Developer export to Excel
+app.get("/api/export/developer/entries/excel", requireAuth, attachRole, requireRole(["developer", "admin"]), async (req, res) => {
+  try {
+    const { data: materialEntries, error: matErr } = await supabaseService
+      .from("material_entries")
+      .select("*, material_items(*)")
+      .eq("developer_id", req.user.id)
+      .is("deleted_at", null)
+      .order("entry_date", { ascending: false });
+    if (matErr) throw matErr;
+
+    const { data: labourEntries, error: labErr } = await supabaseService
+      .from("labour_entries")
+      .select("*, labour_items(*)")
+      .eq("developer_id", req.user.id)
+      .is("deleted_at", null)
+      .order("entry_date", { ascending: false });
+    if (labErr) throw labErr;
+
     const wb = new ExcelJS.Workbook();
     wb.creator = "BrickLedger";
-    const sheet = wb.addWorksheet("Summary");
 
-    sheet.addRow(["Balances"]);
-    sheet.addRow(["Total Received KES", balances.total_received_kes]);
-    sheet.addRow(["Total Contributions GBP", balances.total_contributions_gbp]);
-    sheet.addRow(["Total Expenses KES", balances.total_expenses_kes]);
-    sheet.addRow(["Balance KES", balances.balance_kes]);
-    sheet.addRow([]);
-    sheet.addRow(["Contributions by Investor"]);
-    sheet.addRow(["Investor", "Total GBP"]);
-    contribs.forEach((c) => sheet.addRow([c.investor_name || c.investor_id, c.total_gbp]));
-    sheet.addRow([]);
-    sheet.addRow(["Expenses by Category"]);
-    sheet.addRow(["Category", "Total KES"]);
-    expensesByCat.forEach((e) => sheet.addRow([e.category, e.total_kes]));
-    sheet.addRow([]);
-    sheet.addRow(["Monthly Cashflow"]);
-    sheet.addRow(["Month", "Inflow KES", "Outflow KES", "Net KES"]);
-    monthlyCash.forEach((m) => sheet.addRow([m.month, m.inflow_kes, m.outflow_kes, m.net_kes]));
+    const materialSheet = wb.addWorksheet("Materials");
+    materialSheet.addRow(["DATE", "ITEM DESCRIPTION", "SUPPLIER", "QUANTITY", "UNIT-COST", "TOTAL COST"]);
+    materialEntries.forEach((entry) => {
+      entry.material_items.forEach((item) => {
+        materialSheet.addRow([
+          entry.entry_date,
+          item.description,
+          item.supplier || "",
+          item.quantity,
+          item.unit_cost,
+          Number(item.quantity) * Number(item.unit_cost)
+        ]);
+      });
+    });
+
+    const labourSheet = wb.addWorksheet("Labour");
+    labourSheet.addRow(["DATE", "NAME", "ROLE", "RATE PER DAY", "TOTAL PAY"]);
+    labourEntries.forEach((entry) => {
+      entry.labour_items.forEach((item) => {
+        labourSheet.addRow([entry.entry_date, item.labourer_name, item.role || "", item.rate_per_day, item.total_paid]);
+      });
+    });
 
     const buffer = await wb.xlsx.writeBuffer();
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", 'attachment; filename="financials.xlsx"');
+    res.setHeader("Content-Disposition", 'attachment; filename="developer-entries.xlsx"');
     res.send(Buffer.from(buffer));
   } catch (err) {
-    console.error("excel export error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/export/pdf", requireAuth, attachRole, requireRole(["admin"]), async (req, res) => {
-  try {
-    const startDate = cleanDateParam(req.query.startDate);
-    const endDate = cleanDateParam(req.query.endDate);
-    const type = cleanStringParam(req.query.type);
-    const { balances, contribs, expensesByCat, monthlyCash } = await getReports({ startDate, endDate, type });
-    const doc = new PDFDocument();
-    const bufferStream = new streamBuffers.WritableStreamBuffer();
-
-    doc.fontSize(18).text("BrickLedger Financial Report", { underline: true });
-    doc.moveDown();
-    doc.fontSize(12).text(`Total Received (KES): ${balances.total_received_kes}`);
-    doc.text(`Total Contributions (GBP): ${balances.total_contributions_gbp}`);
-    doc.text(`Total Expenses (KES): ${balances.total_expenses_kes}`);
-    doc.text(`Balance (KES): ${balances.balance_kes}`);
-    doc.moveDown();
-
-    doc.fontSize(14).text("Contributions by Investor");
-    contribs.forEach((c) => doc.fontSize(11).text(`${c.investor_name || c.investor_id}: GBP ${c.total_gbp}`));
-    doc.moveDown();
-
-    doc.fontSize(14).text("Expenses by Category");
-    expensesByCat.forEach((e) => doc.fontSize(11).text(`${e.category}: KES ${e.total_kes}`));
-    doc.moveDown();
-
-    doc.fontSize(14).text("Monthly Cashflow");
-    monthlyCash.forEach((m) =>
-      doc.fontSize(11).text(`${m.month}: inflow ${m.inflow_kes}, outflow ${m.outflow_kes}, net ${m.net_kes}`)
-    );
-
-    doc.end();
-    doc.pipe(bufferStream);
-    bufferStream.on("finish", () => {
-      const pdfData = bufferStream.getBuffer();
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", 'attachment; filename="financials.pdf"');
-      res.send(pdfData);
-    });
-  } catch (err) {
-    console.error("pdf export error:", err);
+    console.error("developer export error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -623,7 +763,7 @@ app.post(
       res.json({ ok: true, path });
     } catch (err) {
       console.error("upload error:", err);
-      res.status(400).json({ error: err.message });
+      res.status(400).json({ error: err.message }); 
     }
   }
 );
